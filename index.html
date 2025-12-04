@@ -11,7 +11,7 @@
     <script src="./vendor/fflate.min.js"></script>
     <script src="./vendor/pako.min.js"></script>
     <script src="./vendor/UPNG.min.js"></script>
-    <script src="./lib/webm-writer-0.3.0.js"></script>
+    <script src="./vendor/webm-writer-0.3.0.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 
     <style>
@@ -172,23 +172,41 @@
         
         .brush-panel { display: flex; flex-direction: column; align-items: center; gap: 8px; padding-top: 4px; overflow: visible; }
         .brush-slider-wrapper { height: 160px; display: flex; align-items: center; justify-content: center; }
-        .brush-slider {
+        .range-input {
             appearance: none;
+            -moz-appearance: none;
+            width: 100%;
+            height: 18px;
+            background: transparent;
+        }
+        .range-input::-webkit-slider-thumb {
+            appearance: none;
+            width: 14px; height: 14px; border-radius: 50%;
+            background: var(--accent);
+        }
+        .range-input::-webkit-slider-runnable-track {
+            height: 5px;
+            background: #666;
+        }
+        .range-input::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            border: none;
+            border-radius: 50%;
+            background: var(--accent);
+        }
+        .range-input::-moz-range-track {
+            height: 5px;
+            background: #666;
+            border: none;
+        }
+        .brush-slider {
             width: 180px;
+            height: 18px;
             transform: rotate(-90deg);
             transform-origin: center;
             margin: -20px 0 0 0;
             background: transparent;
-        }
-        .brush-slider::-webkit-slider-thumb {
-            appearance: none;
-            width: 14px; height: 14px; border-radius: 50%;
-						margin: -5px 0 0 0;
-            background: var(--accent);
-        }
-        .brush-slider::-webkit-slider-runnable-track {
-            height: 5px;
-            background: #666;
         }
         .brush-size-preview {
             border-radius: 50%;
@@ -444,7 +462,7 @@
         <div class="tool-group" style="margin-top: auto; margin-bottom: 20px;">
             <div class="brush-panel">
                 <div class="brush-slider-wrapper">
-                    <input class="brush-slider" type="range" min="1" max="48"
+                    <input class="range-input brush-slider" type="range" min="1" max="48"
                         :value="activeBrushSize"
                         @input="setActiveBrushSize($event.target.valueAsNumber || Number($event.target.value))"
                         title="Brush Size ([ / ])">
@@ -600,13 +618,13 @@
 
                     <div class="form-group">
                         <label>Opacity: {{ Math.round(settings.onionSkin.opacity * 100) }}%</label>
-                        <input type="range" v-model.number="settings.onionSkin.opacity" step="0.1" min="0.1" max="1.0" style="width:100%;">
+                        <input class="range-input" type="range" v-model.number="settings.onionSkin.opacity" step="0.1" min="0.1" max="1.0" style="width:100%;">
                     </div>
                     
                     <div class="form-group">
                         <label>Luminance Threshold: {{ Math.round(settings.onionSkin.luminanceThreshold * 100) }}%</label>
                         <div style="font-size:0.75rem; color:#888; margin-bottom:4px;">Brighter pixels will be hidden (e.g. white background)</div>
-                        <input type="range" v-model.number="settings.onionSkin.luminanceThreshold" step="0.05" min="0.0" max="1.0" style="width:100%;">
+                        <input class="range-input" type="range" v-model.number="settings.onionSkin.luminanceThreshold" step="0.05" min="0.0" max="1.0" style="width:100%;">
                     </div>
 
                     <!-- Target Layers (Button Group) -->
@@ -623,11 +641,7 @@
             <!-- Tool Settings -->
             <div style="margin-bottom: 25px;">
                 <label style="display:block; margin-bottom:10px; font-weight:bold; color:#ddd;">Tools</label>
-                <div class="toggle-row">
-                    <span class="toggle-label">Pen Pressure Sensitivity</span>
-                    <div class="btn-toggle" :class="{active: settings.pressureSensitivity}" @click="settings.pressureSensitivity = !settings.pressureSensitivity"></div>
-                </div>
-                <div class="form-group" style="margin-top:12px;">
+                <div class="form-group">
                     <label>Fill Expansion (px)</label>
                     <input type="number" v-model.number="settings.fillExpansion" min="0" max="20">
                     <div style="font-size:0.75rem; color:#888; margin-top:4px;">Expand bucket fill region by extra pixels (0-20, default 1).</div>
@@ -689,7 +703,7 @@
             <h3>Export WebM</h3>
             <div class="form-group">
                 <label>Quality: {{ Math.round(exportForm.quality * 100) }}%</label>
-                <input type="range" v-model.number="exportForm.quality" min="0.1" max="1.0" step="0.05" style="width:100%;">
+                <input class="range-input" type="range" v-model.number="exportForm.quality" min="0.1" max="1.0" step="0.05" style="width:100%;">
                 <div style="font-size:0.8rem; color:#888; margin-top:6px;">Higher is better quality / larger file (VP8 WebM)</div>
             </div>
             <div class="modal-actions">
@@ -761,7 +775,7 @@ const DEFAULT_SETTINGS = {
         target: "all",
         layers: {}
     },
-    pressureSensitivity: true,
+    pressureSensitivity: false,
     undoLimit: 4,
     backgroundColor: "#FFFFFF",
     fillExpansion: 1
@@ -1179,6 +1193,7 @@ const createAppInstance = () => createApp({
             session.isPanning = false;
             session.isRightClick = false;
             lastPoint = null;
+            smoothedPoint = null;
         };
 
         const recordHistory = () => {
@@ -1248,6 +1263,8 @@ const createAppInstance = () => createApp({
 
         // 2. Drawing Logic (Interpolation)
         let lastPoint = null;
+        let smoothedPoint = null;
+        const SMOOTHING_FACTOR = 0.35;
 
         const drawStroke = (ctx, x, y, pressure = 0.5) => {
             ctx.lineCap = 'round';
@@ -1258,6 +1275,10 @@ const createAppInstance = () => createApp({
             // Pressure sensitivity toggle
             const p = settings.pressureSensitivity ? pressure : 0.5;
             ctx.lineWidth = size * (p + 0.5);
+            const targetPoint = {
+                x,
+                y
+            };
 
             if (session.tool === 'eraser' || session.isRightClick) {
                 ctx.globalCompositeOperation = 'destination-out';
@@ -1265,24 +1286,34 @@ const createAppInstance = () => createApp({
                 ctx.globalCompositeOperation = 'source-over';
             }
 
-            if (!lastPoint) {
+            if (!lastPoint || !smoothedPoint) {
+                smoothedPoint = {
+                    ...targetPoint
+                };
+                lastPoint = {
+                    ...targetPoint
+                };
                 ctx.beginPath();
-                ctx.moveTo(x, y);
-                ctx.lineTo(x, y); // Dot
+                ctx.moveTo(targetPoint.x, targetPoint.y);
+                ctx.lineTo(targetPoint.x, targetPoint.y); // Dot
                 ctx.stroke();
             } else {
-                // Quadratic Curve Interpolation
+                smoothedPoint = {
+                    x: smoothedPoint.x + (targetPoint.x - smoothedPoint.x) * SMOOTHING_FACTOR,
+                    y: smoothedPoint.y + (targetPoint.y - smoothedPoint.y) * SMOOTHING_FACTOR
+                };
+
+                // Quadratic Curve Interpolation with smoothing
                 ctx.beginPath();
                 ctx.moveTo(lastPoint.x, lastPoint.y);
-                const midX = (lastPoint.x + x) / 2;
-                const midY = (lastPoint.y + y) / 2;
-                ctx.quadraticCurveTo(midX, midY, x, y);
-                ctx.lineTo(x, y);
+                const midX = (lastPoint.x + smoothedPoint.x) / 2;
+                const midY = (lastPoint.y + smoothedPoint.y) / 2;
+                ctx.quadraticCurveTo(smoothedPoint.x, smoothedPoint.y, midX, midY);
+                ctx.lineTo(smoothedPoint.x, smoothedPoint.y);
                 ctx.stroke();
             }
             lastPoint = {
-                x,
-                y
+                ...smoothedPoint
             };
         };
 
@@ -1952,6 +1983,7 @@ const createAppInstance = () => createApp({
                 if (!session.isDrawing) return;
                 session.isDrawing = false;
                 lastPoint = null;
+                smoothedPoint = null;
 
                 // Finish Selection
                 if (session.tool === 'select-rect') {
