@@ -181,7 +181,7 @@
         }
         .range-input::-webkit-slider-thumb {
             appearance: none;
-            width: 14px; height: 14px; border-radius: 50%;
+            width: 14px; height: 14px; border-radius: 50%; margin-top: -4px; 
             background: var(--accent);
         }
         .range-input::-webkit-slider-runnable-track {
@@ -1264,7 +1264,7 @@ const createAppInstance = () => createApp({
         // 2. Drawing Logic (Interpolation)
         let lastPoint = null;
         let smoothedPoint = null;
-        const SMOOTHING_FACTOR = 0.35;
+        const SMOOTHING_FACTOR = 0.5;
 
         const drawStroke = (ctx, x, y, pressure = 0.5) => {
             ctx.lineCap = 'round';
