@@ -427,7 +427,7 @@
                 <div class="frame-thumb" :style="{backgroundImage: getThumb(frame)}"></div>
                 <div class="frame-num">{{ idx + 1 }}</div>
             </div>
-            <div class="add-frame-btn" @click="actions.addFrame()">+</div>
+            <div class="add-frame-btn" @click="actions.addFrame(false, 'end')">+</div>
         </div>
     </div>
 
@@ -2101,7 +2101,7 @@ const createAppInstance = () => createApp({
                 };
             },
 
-            addFrame(copy = false) {
+            addFrame(copy = false, insertMode = 'after-current') {
                 if (session.isPlaying) return;
                 let newFrame;
                 if (copy && currentFrame.value) {
@@ -2122,7 +2122,9 @@ const createAppInstance = () => createApp({
                     };
                 }
                 ensureFrameHistory(newFrame.id);
-                const insertAt = Math.min(project.frames.length, session.currentFrameIndex + 1);
+                const insertAt = insertMode === 'end'
+                    ? project.frames.length
+                    : Math.min(project.frames.length, session.currentFrameIndex + 1);
                 project.frames.splice(insertAt, 0, newFrame);
                 actions.gotoFrame(insertAt);
                 //triggerAutoSave();
