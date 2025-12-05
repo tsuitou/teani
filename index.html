@@ -301,10 +301,12 @@
         }
         .modal {
             background: var(--bg-panel); padding: 20px; border-radius: 8px;
-            width: 450px; max-width: 90%;
+            width: 900px; max-width: 90%;
             box-shadow: 0 10px 30px rgba(0,0,0,0.5);
             color: #eee;
         }
+				.row { display: flex; justify-content: space-around; }
+				.column { width: 45% }
         .modal h3 { margin-top: 0; color: var(--accent); border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         .form-group { margin-bottom: 20px; }
         .form-group label { display: block; margin-bottom: 8px; font-size: 0.9rem; color: #aaa; }
@@ -584,7 +586,8 @@
     <div v-if="showSettings" class="modal-overlay" @click.self="showSettings=false">
         <div class="modal">
             <h3>Preferences</h3>
-
+						<div class="row">
+						<div class="column">
             <!-- Onion Skin Section -->
             <div style="margin-bottom: 25px;">
                 <div class="form-group" style="display:flex; justify-content:space-between; align-items:center;">
@@ -636,7 +639,8 @@
                     </div>
                 </div>
             </div>
-
+						</div>
+						<div class="column">
             <!-- Tool Settings -->
             <div style="margin-bottom: 25px;">
                 <label style="display:block; margin-bottom:10px; font-weight:bold; color:#ddd;">Tools</label>
@@ -656,7 +660,7 @@
                 </div>
                 
                 <div class="form-group" style="border-top: 1px solid #444; margin-top: 20px; padding-top: 15px;">
-                    <label style="color: #e74c3c;">Danger Zone</label>
+                    <label>Danger Zone</label>
                     <button class="btn" style="background: #e74c3c; color: white; width: 100%;" @click="actions.clearDatabase">
                         <i class="fas fa-trash-alt"></i> Reset App & Clear Data
                     </button>
@@ -664,13 +668,13 @@
                     </div>
                 </div>
             </div>
-
+						</div>
+						</div>
             <div class="modal-actions">
                 <button class="btn btn-primary" @click="showSettings=false">Close</button>
             </div>
         </div>
-    </div>
-
+		</div>
     <div v-if="showNewProjectModal" class="modal-overlay" @click.self="showNewProjectModal=false">
         <div class="modal">
             <h3>New Project</h3>
@@ -775,7 +779,7 @@ const DEFAULT_SETTINGS = {
         layers: {}
     },
     pressureSensitivity: false,
-    undoLimit: 20,
+    undoLimit: 10,
     backgroundColor: "#FFFFFF",
     fillExpansion: 1
 };
@@ -903,8 +907,8 @@ const createAppInstance = () => createApp({
 
         // Use standard object for history to avoid reactivity overhead with large snapshots
         const history = {
-            undoStack: [],
-            redoStack: [],
+            // frameId -> { undo: [], redo: [] }
+            frames: {},
             limit: 4
         };
 
@@ -934,6 +938,25 @@ const createAppInstance = () => createApp({
             const val = Math.max(1, Math.min(48, v));
             if (session.tool === 'eraser') session.brush.eraserSize = val;
             else session.brush.penSize = val;
+        };
+
+        const getUndoLimit = () => settings.undoLimit || history.limit || 4;
+        const ensureFrameHistory = (frameId) => {
+            if (!frameId) return null;
+            if (!history.frames[frameId]) {
+                history.frames[frameId] = {
+                    undo: [],
+                    redo: []
+                };
+            }
+            return history.frames[frameId];
+        };
+        const resetAllHistory = () => {
+            history.frames = {};
+        };
+        const clearFrameHistory = (frameId) => {
+            if (!frameId) return;
+            delete history.frames[frameId];
         };
 
         // --- Computed ---
@@ -1198,18 +1221,21 @@ const createAppInstance = () => createApp({
         };
 
         const recordHistory = () => {
+            if (session.isPlaying) return;
+            const frame = project.frames[session.currentFrameIndex];
+            if (!frame) return;
             const snap = snapshotCurrentFrame();
             if (!snap) return;
 
-            history.undoStack.push({
-                frame: snap,
-                frameIndex: session.currentFrameIndex
-            });
+            const stacks = ensureFrameHistory(frame.id);
+            if (!stacks) return;
 
-            // Respect custom Undo Limit
-            const limit = settings.undoLimit || 4;
-            if (history.undoStack.length > limit) history.undoStack.shift();
-            history.redoStack = []; // Clear redo on new action
+            stacks.undo.push(snap);
+
+            // Respect custom Undo Limit per frame
+            const limit = getUndoLimit();
+            if (stacks.undo.length > limit) stacks.undo.shift();
+            stacks.redo = []; // Clear redo on new action
         };
 
         const resetSelectionState = () => {
@@ -1227,39 +1253,39 @@ const createAppInstance = () => createApp({
 
         const undo = async () => {
             resetInteractionState();
-            if (history.undoStack.length === 0) return;
+            if (session.isPlaying) return;
+            const frame = currentFrame.value;
+            if (!frame) return;
+            const stacks = ensureFrameHistory(frame.id);
+            if (!stacks || stacks.undo.length === 0) return;
 
             const currentSnap = snapshotCurrentFrame();
             if (currentSnap) {
-                history.redoStack.push({
-                    frame: currentSnap,
-                    frameIndex: session.currentFrameIndex
-                });
+                stacks.redo.push(currentSnap);
             }
 
-            const prev = history.undoStack.pop();
-            session.currentFrameIndex = prev.frameIndex;
-            await restoreFrameSnapshot(prev.frame);
+            const prev = stacks.undo.pop();
+            await restoreFrameSnapshot(prev);
         };
 
         const redo = async () => {
             resetInteractionState();
-            if (history.redoStack.length === 0) return;
+            if (session.isPlaying) return;
+            const frame = currentFrame.value;
+            if (!frame) return;
+            const stacks = ensureFrameHistory(frame.id);
+            if (!stacks || stacks.redo.length === 0) return;
 
             const currentSnap = snapshotCurrentFrame();
             if (currentSnap) {
-                history.undoStack.push({
-                    frame: currentSnap,
-                    frameIndex: session.currentFrameIndex
-                });
+                stacks.undo.push(currentSnap);
 
-                const limit = settings.undoLimit || 4;
-                if (history.undoStack.length > limit) history.undoStack.shift();
+                const limit = getUndoLimit();
+                if (stacks.undo.length > limit) stacks.undo.shift();
             }
 
-            const next = history.redoStack.pop();
-            session.currentFrameIndex = next.frameIndex;
-            await restoreFrameSnapshot(next.frame);
+            const next = stacks.redo.pop();
+            await restoreFrameSnapshot(next);
         };
 
         // 2. Drawing Logic (Interpolation)
@@ -1497,7 +1523,7 @@ const createAppInstance = () => createApp({
             }
         };
 
-        const anchorSelection = () => {
+        const anchorSelection = async () => {
             if (!session.selection.active || !session.selection.floatingData) return;
 
             if (!session.selection.dirty) {
@@ -1509,8 +1535,9 @@ const createAppInstance = () => createApp({
 
             const ctx = getCtx(session.currentLayerId);
             const tempCtx = getTempCtx();
-
-            createImageBitmap(session.selection.floatingData).then(bmp => {
+            if (!ctx) return;
+            try {
+                const bmp = await createImageBitmap(session.selection.floatingData);
                 ctx.drawImage(bmp, session.selection.floatingPos.x, session.selection.floatingPos.y);
 
                 // Clear state
@@ -1518,8 +1545,10 @@ const createAppInstance = () => createApp({
                 session.selection.floatingData = null;
                 session.selection.originPath = null;
                 clearCanvas(tempCtx);
-                saveCurrentLayerToState();
-            });
+                await saveCurrentLayerToState();
+            } catch (err) {
+                console.error('anchorSelection failed', err);
+            }
         };
 
         const createFloatingLayer = () => {
@@ -1817,6 +1846,7 @@ const createAppInstance = () => createApp({
             },
 
             handleCanvasPointerDown: (e) => {
+                if (session.isPlaying) return;
                 session.activePointerId = e.pointerId;
                 try {
                     canvasTemp.value?.setPointerCapture(e.pointerId);
@@ -2046,8 +2076,7 @@ const createAppInstance = () => createApp({
                     settings.backgroundColor = metaOverrides.backgroundColor || settings.backgroundColor;
                 }
                 syncOnionLayerSelection();
-                history.undoStack = [];
-                history.redoStack = [];
+                resetAllHistory();
                 session.selection.active = false;
                 session.selection.path = [];
                 session.selection.originPath = null;
@@ -2073,6 +2102,7 @@ const createAppInstance = () => createApp({
             },
 
             addFrame(copy = false) {
+                if (session.isPlaying) return;
                 let newFrame;
                 if (copy && currentFrame.value) {
                     ensureFrame(session.currentFrameIndex);
@@ -2091,6 +2121,7 @@ const createAppInstance = () => createApp({
                         layers: layersSeed
                     };
                 }
+                ensureFrameHistory(newFrame.id);
                 const insertAt = Math.min(project.frames.length, session.currentFrameIndex + 1);
                 project.frames.splice(insertAt, 0, newFrame);
                 actions.gotoFrame(insertAt);
@@ -2098,8 +2129,10 @@ const createAppInstance = () => createApp({
             },
 
             deleteFrame(idx) {
+                if (session.isPlaying) return;
                 if (project.frames.length <= 1) return;
-                project.frames.splice(idx, 1);
+                const removed = project.frames.splice(idx, 1);
+                if (removed[0]) clearFrameHistory(removed[0].id);
                 if (session.currentFrameIndex >= project.frames.length) {
                     session.currentFrameIndex = project.frames.length - 1;
                 }
@@ -2107,30 +2140,29 @@ const createAppInstance = () => createApp({
                 //triggerAutoSave();
             },
 
-            gotoFrame(idx) {
-                if (session.selection.active) anchorSelection();
+            async gotoFrame(idx) {
+                if (session.isPlaying) return;
+                if (session.selection.active) await anchorSelection();
                 if (idx < 0 || idx >= project.frames.length) return;
                 session.currentFrameIndex = idx;
                 ensureFrame(idx);
+                ensureFrameHistory(project.frames[idx]?.id);
                 renderCurrentFrame();
-                history.undoStack = [];
-                history.redoStack = [];
-                recordHistory(); // baseline for this frame
             },
 
             prevFrame() {
-                actions.gotoFrame(session.currentFrameIndex - 1);
+                return actions.gotoFrame(session.currentFrameIndex - 1);
             },
             nextFrame() {
-                actions.gotoFrame(session.currentFrameIndex + 1);
+                return actions.gotoFrame(session.currentFrameIndex + 1);
             },
 
-            togglePlay() {
+            async togglePlay() {
                 if (session.isPlaying) {
                     session.isPlaying = false;
                 } else {
+                    if (session.selection.active) await anchorSelection();
                     session.isPlaying = true;
-                    if (session.selection.active) anchorSelection();
                     playLoop();
                 }
             },
@@ -2199,8 +2231,6 @@ const createAppInstance = () => createApp({
                 const file = event.target.files[0];
                 if (!file) return;
 
-                if (!confirm("Load project? Unsaved changes will be lost.")) return;
-
                 const reader = new FileReader();
                 reader.onload = async (e) => {
                     try {
@@ -2234,8 +2264,7 @@ const createAppInstance = () => createApp({
                         syncOnionLayerSelection();
                         await nextTick();
                         renderCurrentFrame();
-                        history.undoStack = [];
-                        history.redoStack = [];
+                        resetAllHistory();
                         recordHistory(); // baseline
                         alert("Project loaded!");
                     } catch (err) {
@@ -2275,6 +2304,7 @@ const createAppInstance = () => createApp({
             },
 
             cut() {
+                if (session.isPlaying) return;
                 if (!session.selection.active) return;
                 
                 recordHistory(); // Save state BEFORE cut (restores selection on Undo)
@@ -2320,6 +2350,7 @@ const createAppInstance = () => createApp({
             },
 
             paste() {
+                if (session.isPlaying) return;
                 if (!session.clipboard || session.clipboard.type !== 'image') return;
 
                 // If selection active, anchor it first
@@ -2360,6 +2391,7 @@ const createAppInstance = () => createApp({
             },
 
             async flipFrame(direction = 'horizontal') {
+                if (session.isPlaying) return;
                 const frame = ensureFrame(session.currentFrameIndex);
                 if (!frame) return;
                 if (session.selection.active) anchorSelection();
@@ -2421,10 +2453,9 @@ const createAppInstance = () => createApp({
             },
 
             handleDrop(e, idx) {
+                if (session.isPlaying) return;
                 const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
                 if (fromIdx === idx) return;
-
-                recordHistory();
 
                 const item = project.frames[fromIdx];
                 project.frames.splice(fromIdx, 1);
@@ -2435,6 +2466,7 @@ const createAppInstance = () => createApp({
             },
 
             insertEmptyFrame(idx) {
+                if (session.isPlaying) return;
                 const target = (idx ?? session.currentFrameIndex);
                 const frame = {
                     id: generateUUID(),
@@ -2442,6 +2474,7 @@ const createAppInstance = () => createApp({
                         0: "#FFFFFF"
                     }
                 };
+                ensureFrameHistory(frame.id);
                 project.frames.splice(target + 1, 0, frame);
                 frameContext.visible = false;
                 //triggerAutoSave();
@@ -2458,10 +2491,12 @@ const createAppInstance = () => createApp({
             },
 
             pasteFrame(idx) {
+                if (session.isPlaying) return;
                 if (!session.clipboard || session.clipboard.type !== 'frame') return;
                 const target = (idx ?? session.currentFrameIndex);
                 const cloned = JSON.parse(JSON.stringify(session.clipboard.data));
                 cloned.id = generateUUID();
+                ensureFrameHistory(cloned.id);
                 project.frames.splice(target + 1, 0, cloned);
                 frameContext.visible = false;
                 //triggerAutoSave();
@@ -2510,7 +2545,6 @@ const createAppInstance = () => createApp({
 
                     // Delete DB
                     await idb.deleteDB(DB_NAME);
-                    alert("Database cleared. Reloading...");
                     window.location.reload();
                 } catch (e) {
                     alert("Failed to delete database: " + e.message);
@@ -2761,7 +2795,6 @@ const createAppInstance = () => createApp({
         };
 
         const openNewProjectModal = () => {
-            if (!confirm("Start new project? Unsaved changes will be lost.")) return;
             newProjectForm.width = project.meta.width;
             newProjectForm.height = project.meta.height;
             newProjectForm.fps = project.meta.fps;
