@@ -876,6 +876,8 @@ const createAppInstance = () => createApp({
             index: null
         });
         const workspaceRef = ref(null);
+        const layerBuffers = new Map(); // Offscreen/detached canvas per layer for double buffering
+        let onionBuffer = null; // Offscreen buffer for onion skin rendering
 
         // Core State
         const project = reactive({
@@ -1047,6 +1049,40 @@ const createAppInstance = () => createApp({
         const getCtx = (layerId) => canvasRefs.value[layerId]?.getContext('2d', {
             willReadFrequently: true
         });
+        const getLayerBuffer = (layerId) => {
+            const w = project.meta.width;
+            const h = project.meta.height;
+            let buf = layerBuffers.get(layerId);
+            if (!buf) {
+                buf = typeof OffscreenCanvas !== 'undefined'
+                    ? new OffscreenCanvas(w, h)
+                    : Object.assign(document.createElement('canvas'), {
+                        width: w,
+                        height: h
+                    });
+                layerBuffers.set(layerId, buf);
+            } else if (buf.width !== w || buf.height !== h) {
+                buf.width = w;
+                buf.height = h;
+            }
+            return buf;
+        };
+        const getOnionBuffer = () => {
+            const w = project.meta.width;
+            const h = project.meta.height;
+            if (!onionBuffer) {
+                onionBuffer = typeof OffscreenCanvas !== 'undefined'
+                    ? new OffscreenCanvas(w, h)
+                    : Object.assign(document.createElement('canvas'), {
+                        width: w,
+                        height: h
+                    });
+            } else if (onionBuffer.width !== w || onionBuffer.height !== h) {
+                onionBuffer.width = w;
+                onionBuffer.height = h;
+            }
+            return onionBuffer;
+        };
         const getTempCtx = () => canvasTemp.value?.getContext('2d');
         const clearCanvas = (ctx) => ctx.clearRect(0, 0, project.meta.width, project.meta.height);
 
@@ -1125,42 +1161,38 @@ const createAppInstance = () => createApp({
                 if (res.img) loadedImages.set(res.id, res.img);
             });
 
-            // 2. Render Phase: Clear and Draw synchronously
-
-            // Clear all drawing layers
-            drawingLayers.value.forEach(l => {
-                const ctx = getCtx(l.id);
-                if (ctx) clearCanvas(ctx);
-            });
-
-
-            // Fill Background
-            // FIX: Do not draw layer[0] data to canvasBg. 
-            // canvasBg should be transparent to allow the CSS checkerboard to show through
-            // when the background layer is hidden or erased.
+            // 2. Render Phase: Draw into offscreen buffers, then copy once to visible canvases
             const bgCtx = canvasBg.value?.getContext('2d');
             if (!bgCtx) return;
             bgCtx.clearRect(0, 0, project.meta.width, project.meta.height);
 
-            // Draw Layers
-            for (const layer of drawingLayers.value) {
-                const ctx = getCtx(layer.id);
-                if (!ctx) continue;
+            drawingLayers.value.forEach(layer => {
+                const buffer = getLayerBuffer(layer.id);
+                const bufCtx = buffer.getContext('2d');
+                if (!bufCtx) return;
+                bufCtx.clearRect(0, 0, project.meta.width, project.meta.height);
 
-                // Reset composite operation to ensure proper rendering regardless of previous tool usage (e.g., eraser)
-                ctx.globalCompositeOperation = 'source-over';
                 const src = currentFrame.value.layers[layer.id];
-
-                if (!src) continue;
+                if (!src) return;
                 if (typeof src === 'string' && src.startsWith('#')) {
-                    ctx.fillStyle = src;
-                    ctx.fillRect(0, 0, project.meta.width, project.meta.height);
+                    bufCtx.fillStyle = src;
+                    bufCtx.fillRect(0, 0, project.meta.width, project.meta.height);
                 } else {
                     const img = loadedImages.get(layer.id);
                     if (img) {
-                        ctx.drawImage(img, 0, 0);
+                        bufCtx.drawImage(img, 0, 0);
                     }
                 }
+            });
+
+            // Copy once to visible canvases to minimize flicker
+            for (const layer of drawingLayers.value) {
+                const ctx = getCtx(layer.id);
+                const buffer = getLayerBuffer(layer.id);
+                if (!ctx || !buffer) continue;
+                ctx.globalCompositeOperation = 'copy';
+                ctx.drawImage(buffer, 0, 0);
+                ctx.globalCompositeOperation = 'source-over';
             }
 
             renderOnionSkin();
@@ -1686,33 +1718,43 @@ const createAppInstance = () => createApp({
 
         // 5. Onion Skin Logic
         const renderOnionSkin = async () => {
-            const ctx = canvasOnion.value?.getContext('2d');
-            if (!ctx) return;
-            clearCanvas(ctx);
+            const target = canvasOnion.value;
+            const targetCtx = target?.getContext('2d');
+            if (!targetCtx) return;
 
-            if (!settings.onionSkin.enabled || session.isPlaying) return;
+            const buffer = getOnionBuffer();
+            const bufCtx = buffer.getContext('2d');
+            if (!bufCtx) return;
+            bufCtx.clearRect(0, 0, project.meta.width, project.meta.height);
 
-            // Draw Prev Frame (if enabled)
-            if (settings.onionSkin.enabledPrev) {
-                const idx = session.currentFrameIndex - 1;
-                if (idx >= 0) {
-                    const prevFrame = project.frames[idx];
-                    if (prevFrame) {
-                        await drawTintedFrame(ctx, prevFrame, settings.onionSkin.prevTint, settings.onionSkin.opacity);
+            if (settings.onionSkin.enabled && !session.isPlaying) {
+                // Draw Prev Frame (if enabled)
+                if (settings.onionSkin.enabledPrev) {
+                    const idx = session.currentFrameIndex - 1;
+                    if (idx >= 0) {
+                        const prevFrame = project.frames[idx];
+                        if (prevFrame) {
+                            await drawTintedFrame(bufCtx, prevFrame, settings.onionSkin.prevTint, settings.onionSkin.opacity);
+                        }
+                    }
+                }
+
+                // Draw Next Frame (if enabled)
+                if (settings.onionSkin.enabledNext) {
+                    const idx = session.currentFrameIndex + 1;
+                    if (idx < project.frames.length) {
+                        const nextFrame = project.frames[idx];
+                        if (nextFrame) {
+                            await drawTintedFrame(bufCtx, nextFrame, settings.onionSkin.nextTint, settings.onionSkin.opacity);
+                        }
                     }
                 }
             }
 
-            // Draw Next Frame (if enabled)
-            if (settings.onionSkin.enabledNext) {
-                const idx = session.currentFrameIndex + 1;
-                if (idx < project.frames.length) {
-                    const nextFrame = project.frames[idx];
-                    if (nextFrame) {
-                        await drawTintedFrame(ctx, nextFrame, settings.onionSkin.nextTint, settings.onionSkin.opacity);
-                    }
-                }
-            }
+            // Copy buffered onion render in a single pass to avoid visible clears during async work
+            targetCtx.globalCompositeOperation = 'copy';
+            targetCtx.drawImage(buffer, 0, 0);
+            targetCtx.globalCompositeOperation = 'source-over';
         };
 
         const drawTintedFrame = async (ctx, frame, color, opacity) => {
@@ -2975,6 +3017,9 @@ const createAppInstance = () => createApp({
                 renderOnionSkin();
             }, {
                 deep: true
+            });
+            watch(() => project.layers.map(l => ({ id: l.id, visible: l.visible })), () => {
+                renderOnionSkin();
             });
         });
 
