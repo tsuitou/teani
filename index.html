@@ -520,7 +520,6 @@
                     :style="{zIndex: 100, cursor: canvasCursor}"
                     @pointermove="handlers.pointerMove"
                     @pointerup="handlers.pointerUp"
-                    @pointerleave="handlers.pointerUp"
                 ></canvas>
             </div>
         </div>
@@ -776,7 +775,7 @@ const DEFAULT_SETTINGS = {
         layers: {}
     },
     pressureSensitivity: false,
-    undoLimit: 4,
+    undoLimit: 20,
     backgroundColor: "#FFFFFF",
     fillExpansion: 1
 };
@@ -789,7 +788,7 @@ const createDefaultSession = () => ({
     tool: "pen",
     brush: {
         penSize: 3,
-        eraserSize: 15
+        eraserSize: 21
     },
     colors: {
         primary: "#000000",
@@ -812,6 +811,7 @@ const createDefaultSession = () => ({
     isDrawing: false,
     isRightClick: false,
     isPanning: false,
+    activePointerId: null,
     dragOverIndex: null
 });
 
@@ -1192,6 +1192,7 @@ const createAppInstance = () => createApp({
             session.isDrawing = false;
             session.isPanning = false;
             session.isRightClick = false;
+            session.activePointerId = null;
             lastPoint = null;
             smoothedPoint = null;
         };
@@ -1816,6 +1817,11 @@ const createAppInstance = () => createApp({
             },
 
             handleCanvasPointerDown: (e) => {
+                session.activePointerId = e.pointerId;
+                try {
+                    canvasTemp.value?.setPointerCapture(e.pointerId);
+                } catch (_) {}
+
                 // Middle click pans
                 if (e.button === 1) {
                     session.isPanning = true;
@@ -1974,6 +1980,13 @@ const createAppInstance = () => createApp({
 
             pointerUp: (e) => {
                 session.isRightClick = false;
+                const capturedId = session.activePointerId;
+                if (capturedId !== null) {
+                    try {
+                        canvasTemp.value?.releasePointerCapture(capturedId);
+                    } catch (_) {}
+                }
+                session.activePointerId = null;
 
                 if (session.isPanning) {
                     session.isPanning = false;
@@ -2884,10 +2897,10 @@ const createAppInstance = () => createApp({
                         break;
 
                     case '[':
-                        actions.adjustBrushSize(-2);
+                        actions.adjustBrushSize(-1);
                         break;
                     case ']':
-                        actions.adjustBrushSize(2);
+                        actions.adjustBrushSize(1);
                         break;
                     case 'arrowleft':
                         actions.prevFrame();
