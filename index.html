@@ -779,7 +779,7 @@ const DEFAULT_SETTINGS = {
         layers: {}
     },
     pressureSensitivity: false,
-    undoLimit: 10,
+    undoLimit: 20,
     backgroundColor: "#FFFFFF",
     fillExpansion: 1
 };
@@ -1323,7 +1323,7 @@ const createAppInstance = () => createApp({
         // 2. Drawing Logic (Interpolation)
         let lastPoint = null;
         let smoothedPoint = null;
-        const SMOOTHING_FACTOR = 0.2;
+        const SMOOTHING_FACTOR = 0.15;
 
         const drawStroke = (ctx, x, y, pressure = 0.5) => {
             ctx.lineCap = 'round';
