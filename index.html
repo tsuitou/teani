@@ -645,6 +645,13 @@
             <div style="margin-bottom: 25px;">
                 <label style="display:block; margin-bottom:10px; font-weight:bold; color:#ddd;">Tools</label>
                 <div class="form-group">
+                    <label>Pen Smoothing</label>
+                    <input class="range-input" type="range" min="1" max="10" step="1" v-model.number="penSmoothingStrength" style="width:100%;">
+                    <div style="font-size:0.8rem; color:#888; margin-top:6px;">
+                        Strength {{ penSmoothingStrength }} (factor {{ settings.penSmoothing.toFixed(2) }}, lower factor = smoother)
+                    </div>
+                </div>
+                <div class="form-group">
                     <label>Fill Expansion (px)</label>
                     <input type="number" v-model.number="settings.fillExpansion" min="0" max="20">
                     <div style="font-size:0.75rem; color:#888; margin-top:4px;">Expand bucket fill region by extra pixels (0-20, default 1).</div>
@@ -779,6 +786,7 @@ const DEFAULT_SETTINGS = {
         layers: {}
     },
     pressureSensitivity: false,
+    penSmoothing: 0.15,
     undoLimit: 20,
     backgroundColor: "#FFFFFF",
     fillExpansion: 1
@@ -961,12 +969,28 @@ const createAppInstance = () => createApp({
             delete history.frames[frameId];
         };
 
+        // Pen smoothing bounds (UI strength 1-10 maps into this range)
+        const SMOOTHING_MIN = 0.1;
+        const SMOOTHING_MAX = 0.4;
+
         // --- Computed ---
         const drawingLayers = computed(() => project.layers.filter(l => l.type === 'draw'));
         const currentFrame = computed(() => project.frames[session.currentFrameIndex]);
         const defaultPalette = DEFAULT_PALETTE;
         const canvasCursor = computed(() => (['pen', 'eraser'].includes(session.tool) ? 'none' : 'crosshair'));
         const activeBrushSize = computed(() => session.tool === 'eraser' ? session.brush.eraserSize : session.brush.penSize);
+        const penSmoothingStrength = computed({
+            get: () => {
+                const clamped = Math.min(SMOOTHING_MAX, Math.max(SMOOTHING_MIN, settings.penSmoothing || SMOOTHING_MIN));
+                const ratio = (SMOOTHING_MAX - clamped) / (SMOOTHING_MAX - SMOOTHING_MIN);
+                return Math.round(ratio * 9) + 1; // 1(弱)→10(強)
+            },
+            set: (val) => {
+                const clampedStrength = Math.min(10, Math.max(1, val));
+                const factor = SMOOTHING_MAX - (clampedStrength - 1) * (SMOOTHING_MAX - SMOOTHING_MIN) / 9;
+                settings.penSmoothing = factor;
+            }
+        });
 
         // --- Core Engine Methods ---
 
@@ -1250,6 +1274,9 @@ const createAppInstance = () => createApp({
             session.activePointerId = null;
             lastPoint = null;
             smoothedPoint = null;
+            pendingStroke = null;
+            smoothingRaf = null;
+            lastStrokeTime = null;
         };
 
         const recordHistory = () => {
@@ -1323,7 +1350,33 @@ const createAppInstance = () => createApp({
         // 2. Drawing Logic (Interpolation)
         let lastPoint = null;
         let smoothedPoint = null;
-        const SMOOTHING_FACTOR = 0.15;
+        let pendingStroke = null;
+        let smoothingRaf = null;
+        let lastStrokeTime = null;
+        const SMOOTHING_CATCHUP_STEPS = 5;
+        const BASE_FRAME_SEC = 1 / 60; // Normalize smoothing against 60fps
+        const scheduleSmoothingTick = () => {
+            if (smoothingRaf !== null) return;
+            const tick = () => {
+                smoothingRaf = null;
+                if (!session.isDrawing || !pendingStroke) return;
+                const ctx = getCtx(session.currentLayerId);
+                let needsMore = false;
+                for (let i = 0; i < SMOOTHING_CATCHUP_STEPS; i++) {
+                    if (ctx) {
+                        drawStroke(ctx, pendingStroke.x, pendingStroke.y, pendingStroke.pressure);
+                    }
+                    if (session.isDrawing && pendingStroke && smoothedPoint) {
+                        const dx = pendingStroke.x - smoothedPoint.x;
+                        const dy = pendingStroke.y - smoothedPoint.y;
+                        needsMore = Math.hypot(dx, dy) > 0.5;
+                        if (!needsMore) break;
+                    }
+                }
+                if (needsMore) scheduleSmoothingTick();
+            };
+            smoothingRaf = requestAnimationFrame(tick);
+        };
 
         const drawStroke = (ctx, x, y, pressure = 0.5) => {
             ctx.lineCap = 'round';
@@ -1345,6 +1398,14 @@ const createAppInstance = () => createApp({
                 ctx.globalCompositeOperation = 'source-over';
             }
 
+            const now = performance.now();
+            const dtSec = lastStrokeTime ? Math.max(0, (now - lastStrokeTime) / 1000) : BASE_FRAME_SEC;
+            lastStrokeTime = now;
+
+            // Time-normalized smoothing: interpret settings.penSmoothing as per-60fps factor
+            const baseSmoothing = Math.min(SMOOTHING_MAX, Math.max(SMOOTHING_MIN, settings.penSmoothing || SMOOTHING_MIN));
+            const smoothing = 1 - Math.pow(1 - baseSmoothing, dtSec / BASE_FRAME_SEC);
+
             if (!lastPoint || !smoothedPoint) {
                 smoothedPoint = {
                     ...targetPoint
@@ -1358,8 +1419,8 @@ const createAppInstance = () => createApp({
                 ctx.stroke();
             } else {
                 smoothedPoint = {
-                    x: smoothedPoint.x + (targetPoint.x - smoothedPoint.x) * SMOOTHING_FACTOR,
-                    y: smoothedPoint.y + (targetPoint.y - smoothedPoint.y) * SMOOTHING_FACTOR
+                    x: smoothedPoint.x + (targetPoint.x - smoothedPoint.x) * smoothing,
+                    y: smoothedPoint.y + (targetPoint.y - smoothedPoint.y) * smoothing
                 };
 
                 // Quadratic Curve Interpolation with smoothing
@@ -1969,10 +2030,17 @@ const createAppInstance = () => createApp({
                 if (session.selection.active) anchorSelection();
 
                 const ctx = getCtx(session.currentLayerId);
+                pendingStroke = { x, y, pressure: e.pressure };
                 if (ctx) drawStroke(ctx, x, y, e.pressure);
+                scheduleSmoothingTick();
             },
 
             pointerMove: (e) => {
+                if (session.isDrawing && e.buttons === 0) {
+                    handlers.pointerUp(e);
+                    return;
+                }
+
                 // Pan Logic
                 if (session.isPanning) {
                     const dx = e.clientX - viewport.dragStart.x;
@@ -2036,7 +2104,9 @@ const createAppInstance = () => createApp({
                     renderSelectionOverlay();
                 } else if (['pen', 'eraser'].includes(session.tool) || session.isRightClick) {
                     const ctx = getCtx(session.currentLayerId);
+                    pendingStroke = { x, y, pressure: e.pressure };
                     if (ctx) drawStroke(ctx, x, y, e.pressure);
+                    scheduleSmoothingTick();
                     if (tempCtx) {
                         clearCanvas(tempCtx);
                         tempCtx.beginPath();
@@ -2052,6 +2122,7 @@ const createAppInstance = () => createApp({
 
             pointerUp: (e) => {
                 session.isRightClick = false;
+                pendingStroke = null;
                 const capturedId = session.activePointerId;
                 if (capturedId !== null) {
                     try {
@@ -2067,8 +2138,6 @@ const createAppInstance = () => createApp({
 
                 if (!session.isDrawing) return;
                 session.isDrawing = false;
-                lastPoint = null;
-                smoothedPoint = null;
 
                 // Finish Selection
                 if (session.tool === 'select-rect') {
@@ -2098,8 +2167,38 @@ const createAppInstance = () => createApp({
                         createFloatingLayer();
                     }
                 } else if (['pen', 'eraser'].includes(session.tool) || session.isRightClick) { // Also save on right click finish
+                    const pos = getPointerPos(e);
+                    const ctx = getCtx(session.currentLayerId);
+                    if (ctx && pos) {
+                        // Ensure final segment reaches pointer position even when smoothing is strong
+                        ctx.lineCap = 'round';
+                        ctx.lineJoin = 'round';
+                        ctx.strokeStyle = session.colors.primary;
+                        const size = (session.tool === 'eraser' || session.isRightClick) ? session.brush.eraserSize : session.brush.penSize;
+                        const p = settings.pressureSensitivity ? (e.pressure || 0.5) : 0.5;
+                        ctx.lineWidth = size * (p + 0.5);
+                        ctx.globalCompositeOperation = (session.tool === 'eraser' || session.isRightClick) ? 'destination-out' : 'source-over';
+
+                        if (!lastPoint) {
+                            ctx.beginPath();
+                            ctx.moveTo(pos.x, pos.y);
+                            ctx.lineTo(pos.x, pos.y);
+                            ctx.stroke();
+                        } else {
+                            ctx.beginPath();
+                            ctx.moveTo(lastPoint.x, lastPoint.y);
+                            ctx.lineTo(pos.x, pos.y);
+                            ctx.stroke();
+                        }
+                        lastPoint = { x: pos.x, y: pos.y };
+                        smoothedPoint = { ...lastPoint };
+                    }
                     saveCurrentLayerToState();
                 }
+                lastPoint = null;
+                smoothedPoint = null;
+                lastStrokeTime = null;
+                smoothingRaf = null;
             }
         };
 
@@ -3038,6 +3137,7 @@ const createAppInstance = () => createApp({
             defaultPalette,
             frameContext,
             activeBrushSize,
+            penSmoothingStrength,
             canvasCursor,
             handlers,
             actions,
