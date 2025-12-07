@@ -2224,6 +2224,13 @@ const createAppInstance = () => createApp({
             }
         };
 
+        // Ensure drawing ends even if the pointer is released outside the canvas
+        const handleGlobalPointerRelease = (e) => {
+            if (!session.isDrawing) return;
+            const fallbackPos = smoothedPoint || lastPoint || pendingStroke;
+            handlers.pointerUp(e, { forcePos: fallbackPos });
+        };
+
         // --- Actions ---
         const actions = {
             async initProject(metaOverrides = null) {
@@ -3132,6 +3139,9 @@ const createAppInstance = () => createApp({
             window.addEventListener('click', () => {
                 frameContext.visible = false;
             });
+
+            window.addEventListener('pointerup', handleGlobalPointerRelease);
+            window.addEventListener('pointercancel', handleGlobalPointerRelease);
 
             // Watchers
             watch(() => settings.onionSkin, () => {
