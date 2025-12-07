@@ -242,6 +242,9 @@
             box-shadow: 0 0 20px rgba(0,0,0,0.5);
             cursor: crosshair;
         }
+        .canvas-viewport {
+            transform-origin: 0 0;
+        }
         canvas {
             position: absolute;
             top: 0; left: 0;
@@ -492,8 +495,9 @@
         @contextmenu.prevent
     >
         <div class="canvas-viewport" 
+            ref="canvasViewportRef"
             :style="{
-                transform: `translate(${viewport.pan.x}px, ${viewport.pan.y}px) scale(${viewport.zoom})`,
+                transform: `matrix(${viewport.zoom}, 0, 0, ${viewport.zoom}, ${viewport.pan.x}, ${viewport.pan.y})`,
                 width: project.meta.width + 'px', 
                 height: project.meta.height + 'px'
             }"
@@ -786,7 +790,7 @@ const DEFAULT_SETTINGS = {
         layers: {}
     },
     pressureSensitivity: false,
-    penSmoothing: 0.15,
+    penSmoothing: 0.33,
     undoLimit: 20,
     backgroundColor: "#FFFFFF",
     fillExpansion: 1
@@ -877,6 +881,7 @@ const createAppInstance = () => createApp({
         const canvasOnion = ref(null);
         const frameStripRef = ref(null);
         const fileInput = ref(null);
+        const canvasViewportRef = ref(null);
         const frameContext = reactive({
             visible: false,
             x: 0,
@@ -1355,30 +1360,52 @@ const createAppInstance = () => createApp({
         let lastStrokeTime = null;
         const SMOOTHING_CATCHUP_STEPS = 5;
         const BASE_FRAME_SEC = 1 / 60; // Normalize smoothing against 60fps
-        const scheduleSmoothingTick = () => {
-            if (smoothingRaf !== null) return;
-            const tick = () => {
-                smoothingRaf = null;
-                if (!session.isDrawing || !pendingStroke) return;
-                const ctx = getCtx(session.currentLayerId);
-                let needsMore = false;
-                for (let i = 0; i < SMOOTHING_CATCHUP_STEPS; i++) {
-                    if (ctx) {
-                        drawStroke(ctx, pendingStroke.x, pendingStroke.y, pendingStroke.pressure);
-                    }
-                    if (session.isDrawing && pendingStroke && smoothedPoint) {
-                        const dx = pendingStroke.x - smoothedPoint.x;
-                        const dy = pendingStroke.y - smoothedPoint.y;
-                        needsMore = Math.hypot(dx, dy) > 0.5;
-                        if (!needsMore) break;
-                    }
+        const processPendingStroke = () => {
+            if (!session.isDrawing || !pendingStroke) return false;
+            const ctx = getCtx(session.currentLayerId);
+            if (!ctx) return false;
+
+            const now = performance.now();
+            const totalDtSec = lastStrokeTime ? Math.max(0, (now - lastStrokeTime) / 1000) : BASE_FRAME_SEC;
+            const stepDtSec = Math.max(BASE_FRAME_SEC / SMOOTHING_CATCHUP_STEPS, totalDtSec / SMOOTHING_CATCHUP_STEPS);
+            lastStrokeTime = now;
+
+            let needsMore = false;
+            for (let i = 0; i < SMOOTHING_CATCHUP_STEPS; i++) {
+                drawStroke(ctx, pendingStroke.x, pendingStroke.y, pendingStroke.pressure, stepDtSec);
+                if (session.isDrawing && pendingStroke && smoothedPoint) {
+                    const dx = pendingStroke.x - smoothedPoint.x;
+                    const dy = pendingStroke.y - smoothedPoint.y;
+                    needsMore = Math.hypot(dx, dy) > 0.5;
+                    if (!needsMore) break;
                 }
-                if (needsMore) scheduleSmoothingTick();
-            };
-            smoothingRaf = requestAnimationFrame(tick);
+            }
+            return needsMore;
         };
 
-        const drawStroke = (ctx, x, y, pressure = 0.5) => {
+        const scheduleSmoothingTick = (immediate = false) => {
+            const run = () => {
+                smoothingRaf = null;
+                const needsMore = processPendingStroke();
+                if (needsMore) scheduleSmoothingTick();
+            };
+
+            // If already scheduled and not forcing immediate, let the existing RAF handle the latest pendingStroke.
+            if (smoothingRaf !== null && !immediate) return;
+
+            if (smoothingRaf !== null && immediate) {
+                cancelAnimationFrame(smoothingRaf);
+                smoothingRaf = null;
+            }
+
+            if (immediate) {
+                run();
+                return;
+            }
+            smoothingRaf = requestAnimationFrame(run);
+        };
+
+        const drawStroke = (ctx, x, y, pressure = 0.5, dtSec = BASE_FRAME_SEC) => {
             ctx.lineCap = 'round';
             ctx.lineJoin = 'round';
             ctx.strokeStyle = session.colors.primary;
@@ -1397,10 +1424,6 @@ const createAppInstance = () => createApp({
             } else {
                 ctx.globalCompositeOperation = 'source-over';
             }
-
-            const now = performance.now();
-            const dtSec = lastStrokeTime ? Math.max(0, (now - lastStrokeTime) / 1000) : BASE_FRAME_SEC;
-            lastStrokeTime = now;
 
             // Time-normalized smoothing: interpret settings.penSmoothing as per-60fps factor
             const baseSmoothing = Math.min(SMOOTHING_MAX, Math.max(SMOOTHING_MIN, settings.penSmoothing || SMOOTHING_MIN));
@@ -1882,41 +1905,41 @@ const createAppInstance = () => createApp({
 
         // --- Interaction Handlers ---
 
-        // Transform screen coords to canvas coords
+        // Transform screen coords to canvas coords using the current pan/zoom matrix.
         const getPointerPos = (e) => {
-            const rect = canvasTemp.value.getBoundingClientRect();
-            // Scaling logic: (Screen - Offset) / Zoom
-            // But getBoundingClientRect returns the SCALED size.
-            // So relative position in element * (OriginalSize / ScaledSize)
-            const scaleX = project.meta.width / rect.width;
-            const scaleY = project.meta.height / rect.height;
-
-            return {
-                x: (e.clientX - rect.left) * scaleX,
-                y: (e.clientY - rect.top) * scaleY
-            };
+            const el = canvasViewportRef.value;
+            const rect = el?.getBoundingClientRect();
+            if (!el || !rect) return { x: 0, y: 0 };
+            const m = getComputedStyle(el).transform;
+            const matrix = m && m !== 'none' ? new DOMMatrix(m) : new DOMMatrix();
+            // rect is already translated; neutralize translation before inverting
+            matrix.e = 0;
+            matrix.f = 0;
+            const inv = matrix.inverse();
+            const point = new DOMPoint(e.clientX - rect.left, e.clientY - rect.top);
+            const world = inv.transformPoint(point);
+            return { x: world.x, y: world.y };
         };
 
         const handlers = {
             handleWheel: (e) => {
-                const rect = canvasTemp.value?.getBoundingClientRect();
+                const rect = canvasViewportRef.value?.getBoundingClientRect();
                 if (!rect) return;
 
-                // Zoom focus on cursor
-                // Calculate cursor position relative to canvas (unscaled)
+                // Cursor position relative to viewport element
                 const relX = e.clientX - rect.left;
                 const relY = e.clientY - rect.top;
-
-                // Convert to world coordinates
-                const worldX = (relX - viewport.pan.x) / viewport.zoom;
-                const worldY = (relY - viewport.pan.y) / viewport.zoom;
+                // Current world coord under cursor (invert current pan/zoom)
+                const worldPt = getPointerPos(e);
 
                 const delta = -Math.sign(e.deltaY) * 0.1;
                 const newZoom = Math.max(0.1, Math.min(5.0, viewport.zoom + delta));
 
-                // Adjust pan to keep world coordinates stationary under cursor
-                viewport.pan.x = relX - worldX * newZoom;
-                viewport.pan.y = relY - worldY * newZoom;
+                // Adjust pan to keep the same world point under the cursor
+                const screenX = viewport.pan.x + worldPt.x * viewport.zoom;
+                const screenY = viewport.pan.y + worldPt.y * viewport.zoom;
+                viewport.pan.x = screenX - worldPt.x * newZoom;
+                viewport.pan.y = screenY - worldPt.y * newZoom;
                 viewport.zoom = newZoom;
             },
 
@@ -2029,15 +2052,15 @@ const createAppInstance = () => createApp({
                 // Float layer anchor if drawing outside? Yes.
                 if (session.selection.active) anchorSelection();
 
-                const ctx = getCtx(session.currentLayerId);
                 pendingStroke = { x, y, pressure: e.pressure };
-                if (ctx) drawStroke(ctx, x, y, e.pressure);
                 scheduleSmoothingTick();
             },
 
             pointerMove: (e) => {
                 if (session.isDrawing && e.buttons === 0) {
-                    handlers.pointerUp(e);
+                    // Button released outside; finish using last smoothed/known point to avoid drawing at re-entry location.
+                    const fallbackPos = smoothedPoint || lastPoint || pendingStroke;
+                    handlers.pointerUp(e, { forcePos: fallbackPos });
                     return;
                 }
 
@@ -2103,10 +2126,8 @@ const createAppInstance = () => createApp({
                     clearCanvas(tempCtx);
                     renderSelectionOverlay();
                 } else if (['pen', 'eraser'].includes(session.tool) || session.isRightClick) {
-                    const ctx = getCtx(session.currentLayerId);
-                    pendingStroke = { x, y, pressure: e.pressure };
-                    if (ctx) drawStroke(ctx, x, y, e.pressure);
-                    scheduleSmoothingTick();
+                pendingStroke = { x, y, pressure: e.pressure };
+                scheduleSmoothingTick();
                     if (tempCtx) {
                         clearCanvas(tempCtx);
                         tempCtx.beginPath();
@@ -2120,7 +2141,8 @@ const createAppInstance = () => createApp({
                 }
             },
 
-            pointerUp: (e) => {
+            pointerUp: (e, opts = {}) => {
+                const forcePos = opts.forcePos || null;
                 session.isRightClick = false;
                 pendingStroke = null;
                 const capturedId = session.activePointerId;
@@ -2167,7 +2189,7 @@ const createAppInstance = () => createApp({
                         createFloatingLayer();
                     }
                 } else if (['pen', 'eraser'].includes(session.tool) || session.isRightClick) { // Also save on right click finish
-                    const pos = getPointerPos(e);
+                    const pos = forcePos ? forcePos : getPointerPos(e);
                     const ctx = getCtx(session.currentLayerId);
                     if (ctx && pos) {
                         // Ensure final segment reaches pointer position even when smoothing is strong
@@ -3156,6 +3178,7 @@ const createAppInstance = () => createApp({
             exportForm,
             brushPresets,
             workspaceRef,
+            canvasViewportRef,
             setActiveBrushSize
         };
     }
