@@ -1235,50 +1235,6 @@ const createAppInstance = () => createApp({
             }
             return out;
         };
-        const flipImageData = (img, flipX, flipY) => {
-            if (!flipX && !flipY) return img;
-            const out = new ImageData(img.width, img.height);
-            const src = img.data, dst = out.data;
-            for (let y = 0; y < img.height; y++) {
-                for (let x = 0; x < img.width; x++) {
-                    const sx = flipX ? img.width - 1 - x : x;
-                    const sy = flipY ? img.height - 1 - y : y;
-                    const si = (sy * img.width + sx) * 4;
-                    const di = (y * img.width + x) * 4;
-                    dst[di] = src[si];
-                    dst[di + 1] = src[si + 1];
-                    dst[di + 2] = src[si + 2];
-                    dst[di + 3] = src[si + 3];
-                }
-            }
-            return out;
-        };
-        const flipBBox = (bbox, canvasW, canvasH, flipX, flipY) => ({
-            x: flipX ? canvasW - bbox.x - bbox.w : bbox.x,
-            y: flipY ? canvasH - bbox.y - bbox.h : bbox.y,
-            w: bbox.w,
-            h: bbox.h
-        });
-        const transformPixelHistoryForFlip = (frameId, flipX, flipY) => {
-            if (!flipX && !flipY) return;
-            const ch = canvasHistories.get(frameId);
-            if (!ch) return;
-            const w = project.meta.width;
-            const h = project.meta.height;
-            const transformStack = (stack) => {
-                for (const entry of stack) {
-                    if (entry.type !== 'pixel' || entry.frameId !== frameId) continue;
-                    entry.patches = entry.patches.map(p => ({
-                        ...p,
-                        bbox: flipBBox(p.bbox, w, h, flipX, flipY),
-                        data: flipImageData(p.data, flipX, flipY)
-                    }));
-                }
-            };
-            transformStack(ch.undo);
-            transformStack(ch.redo);
-        };
-
         const trimStack = (stack) => {
             const limit = getUndoLimit();
             while (stack.length > limit) stack.shift();
@@ -1552,6 +1508,21 @@ const createAppInstance = () => createApp({
             return btoa(bin);
         };
         const pngBytesToDataUrl = (bytes) => 'data:image/png;base64,' + bytesToBase64(bytes);
+        const pngDataUrlToBytes = (src) => {
+            if (typeof src !== 'string') return null;
+            const comma = src.indexOf(',');
+            if (comma < 0) return null;
+            const header = src.slice(0, comma).toLowerCase();
+            if (!header.startsWith('data:image/png') || !header.includes(';base64')) return null;
+            try {
+                const bin = atob(src.slice(comma + 1));
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                return bytes;
+            } catch (_) {
+                return null;
+            }
+        };
 
         // Frame ids that must stay decoded: current, onion neighbours, and playback lookahead.
         const protectedFrameIds = () => {
@@ -1735,11 +1706,18 @@ const createAppInstance = () => createApp({
             c.height = h;
             const ctx = c.getContext('2d');
 
+            const cells = peekFrameCells(frame.id) || {};
             for (const l of project.layers) {
                 if (l.type !== 'draw') continue;
-                if (l.id !== 0 && !l.visible) continue;
-                const surface = cellSurface(frame, l.id);
-                ctx.drawImage(surface, 0, 0, w, h);
+                if (!l.visible) continue;
+                const surface = cells[l.id];
+                if (surface) {
+                    ctx.drawImage(surface, 0, 0, w, h);
+                } else if (l.id === 0) {
+                    // Legacy projects may omit the background cell.
+                    ctx.fillStyle = settings.backgroundColor || '#FFFFFF';
+                    ctx.fillRect(0, 0, w, h);
+                }
             }
             return c.toDataURL('image/jpeg', 0.8);
         };
@@ -1842,6 +1820,32 @@ const createAppInstance = () => createApp({
                 if (frame) frame.thumbnail = generateThumbnail(frame);
             }, 150);
         };
+        let thumbnailRefreshToken = 0;
+        const scheduleIdleWork = (callback) => {
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(callback, { timeout: 200 });
+            } else {
+                setTimeout(() => callback({ timeRemaining: () => 8 }), 0);
+            }
+        };
+        // Visibility is global to the layer stack, so every cached thumbnail becomes stale.
+        // Refresh incrementally and use peekFrameCells() so dormant frames are never promoted.
+        const refreshAllThumbnails = () => {
+            const token = ++thumbnailRefreshToken;
+            let index = 0;
+            const refreshChunk = (deadline) => {
+                if (token !== thumbnailRefreshToken) return;
+                let refreshed = 0;
+                while (index < project.frames.length &&
+                    (refreshed === 0 || deadline.timeRemaining() > 4)) {
+                    const frame = project.frames[index++];
+                    frame.thumbnail = generateThumbnail(frame);
+                    refreshed++;
+                }
+                if (index < project.frames.length) scheduleIdleWork(refreshChunk);
+            };
+            scheduleIdleWork(refreshChunk);
+        };
 
         // Finalize a pixel edit: flush working canvases to cells, commit region-diff
         // history (no-op if no edit is open), and refresh the thumbnail.
@@ -1851,14 +1855,6 @@ const createAppInstance = () => createApp({
             if (!frame) return;
             flushFrameCells(frame);
             commitPixelEdit();
-            scheduleThumbnail(frame);
-        };
-
-        const saveCurrentLayerToStateWithoutHistory = () => {
-            ensureFrame(session.currentFrameIndex);
-            const frame = currentFrame.value;
-            if (!frame) return;
-            flushFrameCells(frame);
             scheduleThumbnail(frame);
         };
 
@@ -2174,32 +2170,38 @@ const createAppInstance = () => createApp({
                 return data[pos] === startR && data[pos + 1] === startG && data[pos + 2] === startB && data[pos + 3] === startA;
             };
 
-            const stack = [
-                [startX, startY]
-            ];
-            const filledMask = new Uint8Array(w * h); // 1 when this fill operation touched the pixel
+            const startIdx = startY * w + startX;
+            const stack = [startIdx];
+            // Mark on enqueue, not on pop. This guarantees that each pixel is queued once.
+            const filledMask = new Uint8Array(w * h);
+            filledMask[startIdx] = 1;
             const frontier = [];
+            const tryPush = (x, y) => {
+                if (x < 0 || y < 0 || x >= w || y >= h || !insideSelection(x, y)) return;
+                const idx = y * w + x;
+                if (filledMask[idx] || !matchStart(idx * 4)) return;
+                filledMask[idx] = 1;
+                stack.push(idx);
+            };
 
             while (stack.length) {
-                const [cx, cy] = stack.pop();
-                const pos = (cy * w + cx) * 4;
+                const idx = stack.pop();
+                const cx = idx % w;
+                const cy = (idx - cx) / w;
+                const pos = idx * 4;
 
-                if (insideSelection(cx, cy) && matchStart(pos)) {
+                if (matchStart(pos)) {
                     data[pos] = r;
                     data[pos + 1] = g;
                     data[pos + 2] = b;
                     data[pos + 3] = a;
 
-                    const idx = cy * w + cx;
-                    if (!filledMask[idx]) {
-                        filledMask[idx] = 1;
-                        frontier.push([cx, cy]);
-                    }
+                    frontier.push([cx, cy]);
 
-                    if (cx > 0) stack.push([cx - 1, cy]);
-                    if (cx < w - 1) stack.push([cx + 1, cy]);
-                    if (cy > 0) stack.push([cx, cy - 1]);
-                    if (cy < h - 1) stack.push([cx, cy + 1]);
+                    tryPush(cx - 1, cy);
+                    tryPush(cx + 1, cy);
+                    tryPush(cx, cy - 1);
+                    tryPush(cx, cy + 1);
                 }
             }
 
@@ -2435,38 +2437,47 @@ const createAppInstance = () => createApp({
             }
         };
 
+        let selectionAnimationFrame = null;
+        const selectionAnimationNeeded = () => {
+            const isSelecting = session.isDrawing && session.tool.startsWith('select');
+            return isSelecting || hasSelectionShape();
+        };
         const animateSelection = (timestamp) => {
-            requestAnimationFrame(animateSelection);
-
+            selectionAnimationFrame = null;
+            if (!selectionAnimationNeeded()) {
+                lastAnimateTime = 0;
+                return;
+            }
             if (!lastAnimateTime) lastAnimateTime = timestamp;
             const delta = timestamp - lastAnimateTime;
             lastAnimateTime = timestamp;
 
-            const isSelecting = session.isDrawing && session.tool.startsWith('select');
-            const hasActiveSelection = hasSelectionShape();
+            const isMoving = (session.tool === 'move' && session.isDrawing) || session.isPanning;
+            if (!isMoving) {
+                selectionDashOffset = (selectionDashOffset + delta * 0.015) % 8;
+            }
 
-            if (isSelecting || hasActiveSelection) {
-                const isMoving = (session.tool === 'move' && session.isDrawing) || session.isPanning;
-                if (!isMoving) {
-                    selectionDashOffset = (selectionDashOffset + delta * 0.015) % 8;
-                }
+            const tempCtx = getTempCtx();
+            if (tempCtx) {
+                clearCanvas(tempCtx);
+                renderSelectionOverlay();
 
-                const tempCtx = getTempCtx();
-                if (tempCtx) {
-                    clearCanvas(tempCtx);
-                    renderSelectionOverlay();
-
-                    // Restore brush preview cursor if active and pointer is over canvas
-                    if (!session.isDrawing && lastCursorPos && ['pen', 'eraser', 'bucket'].includes(session.tool)) {
-                        tempCtx.beginPath();
-                        tempCtx.strokeStyle = '#aaa';
-                        tempCtx.lineWidth = 1 / viewport.zoom;
-                        const size = session.tool === 'eraser' ? activeBrushSize.value : session.brush.penSize;
-                        tempCtx.arc(lastCursorPos.x, lastCursorPos.y, size / 2, 0, Math.PI * 2);
-                        tempCtx.stroke();
-                    }
+                // Restore brush preview cursor if active and pointer is over canvas
+                if (!session.isDrawing && lastCursorPos && ['pen', 'eraser', 'bucket'].includes(session.tool)) {
+                    tempCtx.beginPath();
+                    tempCtx.strokeStyle = '#aaa';
+                    tempCtx.lineWidth = 1 / viewport.zoom;
+                    const size = session.tool === 'eraser' ? activeBrushSize.value : session.brush.penSize;
+                    tempCtx.arc(lastCursorPos.x, lastCursorPos.y, size / 2, 0, Math.PI * 2);
+                    tempCtx.stroke();
                 }
             }
+            selectionAnimationFrame = requestAnimationFrame(animateSelection);
+        };
+        const startSelectionAnimation = () => {
+            if (selectionAnimationFrame !== null || !selectionAnimationNeeded()) return;
+            lastAnimateTime = 0;
+            selectionAnimationFrame = requestAnimationFrame(animateSelection);
         };
 
         const anchorSelection = async () => {
@@ -3356,16 +3367,34 @@ const createAppInstance = () => createApp({
                         const framesIn = Array.isArray(loadedFrames) ? loadedFrames : [];
                         const frameMeta = [];
                         for (const f of framesIn) {
-                            const dst = {};
                             const layers = f.layers || {};
-                            for (const k in layers) {
-                                const surface = makeSurface(project.meta.width, project.meta.height);
-                                const img = await loadImageOrNull(layers[k]);
-                                if (img) surface.getContext('2d').drawImage(img, 0, 0);
-                                dst[k] = surface;
-                            }
                             const id = f.id || generateUUID();
-                            cellStore.set(id, dst);
+                            const bytesSet = {};
+                            let canStayDormant = true;
+                            for (const k in layers) {
+                                const bytes = pngDataUrlToBytes(layers[k]);
+                                if (!bytes) {
+                                    canStayDormant = false;
+                                    break;
+                                }
+                                bytesSet[k] = bytes;
+                            }
+                            if (canStayDormant) {
+                                // JSON already contains compressed PNGs. Keep them compressed
+                                // and decode only the current frame during renderCurrentFrame().
+                                dormantStore.set(id, bytesSet);
+                            } else {
+                                // Compatibility path for non-PNG/legacy image URLs.
+                                const dst = {};
+                                for (const k in layers) {
+                                    const surface = makeSurface(project.meta.width, project.meta.height);
+                                    const img = await loadImageOrNull(layers[k]);
+                                    if (img) surface.getContext('2d').drawImage(img, 0, 0);
+                                    dst[k] = surface;
+                                }
+                                cellStore.set(id, dst);
+                                touchFrame(id);
+                            }
                             frameMeta.push({ id, thumbnail: f.thumbnail || null });
                         }
                         project.frames = frameMeta;
@@ -3527,7 +3556,9 @@ const createAppInstance = () => createApp({
                 const h = project.meta.height;
                 const flipX = direction === 'horizontal' || direction === 'both';
                 const flipY = direction === 'vertical' || direction === 'both';
+                if (!flipX && !flipY) return;
 
+                beginPixelEdit(drawingLayers.value.map(layer => layer.id));
                 for (const layer of drawingLayers.value) {
                     const ctx = getCtx(layer.id);
                     const cvs = canvasRefs.value[layer.id];
@@ -3544,8 +3575,9 @@ const createAppInstance = () => createApp({
                     ctx.restore();
                 }
 
-                transformPixelHistoryForFlip(frame.id, flipX, flipY);
-                saveCurrentLayerToStateWithoutHistory();
+                // The flip is a normal history entry. Older entries stay in their original
+                // coordinate system because undoing this entry restores that system first.
+                saveCurrentLayerToState();
             },
 
             // --- Drag & Drop Frames ---
@@ -4339,14 +4371,11 @@ const createAppInstance = () => createApp({
                             }
                             const newZoom = Math.max(0.1, Math.min(10.0, viewport.zoom * zoomFactor));
 
-                            const dx = centerX - prevCenter.x;
-                            const dy = centerY - prevCenter.y;
+                            const worldCenterX = (prevCenter.x - viewport.pan.x) / viewport.zoom;
+                            const worldCenterY = (prevCenter.y - viewport.pan.y) / viewport.zoom;
 
-                            const worldCenterX = (centerX - viewport.pan.x) / viewport.zoom;
-                            const worldCenterY = (centerY - viewport.pan.y) / viewport.zoom;
-
-                            viewport.pan.x = centerX + dx - worldCenterX * newZoom;
-                            viewport.pan.y = centerY + dy - worldCenterY * newZoom;
+                            viewport.pan.x = centerX - worldCenterX * newZoom;
+                            viewport.pan.y = centerY - worldCenterY * newZoom;
                             viewport.zoom = newZoom;
                         }
 
@@ -4376,15 +4405,17 @@ const createAppInstance = () => createApp({
             });
             watch(() => project.layers.map(l => ({ id: l.id, visible: l.visible })), () => {
                 renderOnionSkin();
+                refreshAllThumbnails();
             });
+            watch(selectionAnimationNeeded, (needed) => {
+                if (needed) startSelectionAnimation();
+            }, { immediate: true });
             // In 'active' target mode the onion follows the current layer; changing it (without a
             // frame re-render) must refresh the onion. Harmless no-op in 'all' mode (cached).
             watch(() => session.currentLayerId, () => {
                 renderOnionSkin();
             });
 
-            // Start selection animation
-            requestAnimationFrame(animateSelection);
         });
 
         return {
