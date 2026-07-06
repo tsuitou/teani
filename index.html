@@ -144,7 +144,11 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            /* Touch gestures (tap / swipe-scroll / long-press drag) are handled in JS;
+               native panning would swallow the pointermove stream we need. */
+            touch-action: none;
         }
+        .frame-card.touch-dragging { opacity: 0.5; }
         .frame-card.active { border-color: var(--accent); box-shadow: 0 0 5px var(--accent); }
         .frame-card.drag-over { border-left: 4px solid var(--accent); opacity: 0.8; }
         .frame-thumb { flex: 1; width: 100%; background-size: contain; background-repeat: no-repeat; background-position: center; background-color: #fff; }
@@ -557,6 +561,10 @@
                 @drop="actions.handleDrop($event, idx)"
                 @click="actions.gotoFrame(idx)"
                 @contextmenu.prevent="actions.handleFrameContext($event, idx)"
+                @pointerdown="cardHandlers.down($event, idx)"
+                @pointermove="cardHandlers.move($event)"
+                @pointerup="cardHandlers.up($event)"
+                @pointercancel="cardHandlers.cancel($event)"
             >
                 <div class="frame-thumb" :style="{backgroundImage: getThumb(frame)}"></div>
                 <div class="frame-num">{{ idx + 1 }}</div>
@@ -663,8 +671,11 @@
         </div>
         
         <!-- Zoom HUD -->
-        <div style="position: absolute; bottom: 20px; right: 20px; background: rgba(0,0,0,0.5); padding: 5px 10px; border-radius: 4px; font-size: 0.8rem; pointer-events: none;">
-            {{ Math.round(viewport.zoom * 100) }}%
+        <div style="position: absolute; bottom: 20px; right: 20px; background: rgba(0,0,0,0.5); padding: 5px 8px; border-radius: 4px; font-size: 0.8rem; display: flex; align-items: center; gap: 8px;"
+            @pointerdown.stop @wheel.stop.prevent>
+            <span style="min-width: 40px; text-align: right;">{{ Math.round(viewport.zoom * 100) }}%</span>
+            <button class="btn-transport" style="width: auto; height: 24px; padding: 0 8px; font-size: 0.75rem;" @click="fitViewport" title="Fit to screen">Fit</button>
+            <button class="btn-transport" style="width: auto; height: 24px; padding: 0 8px; font-size: 0.75rem;" @click="resetViewport" title="Reset zoom to 100%">1:1</button>
         </div>
     </div>
 
@@ -936,6 +947,7 @@ const {
     ref,
     computed,
     onMounted,
+    onUnmounted,
     watch,
     nextTick,
     toRaw
@@ -1534,21 +1546,102 @@ const createAppInstance = () => createApp({
             if (session.isPlaying) for (let k = 1; k <= PLAYBACK_LOOKAHEAD; k++) add(ci + k);
             return ids;
         };
+        // PNG-encode a frame's cells off the main thread (falls back to sync when no worker).
+        const encodeFrameCellsAsync = async (cells) => {
+            const w = await getExportWorker();
+            if (!w) return encodeFrameCells(cells);
+            const out = {};
+            for (const k in cells) {
+                const c = cells[k];
+                const buf = c.getContext('2d', { willReadFrequently: true })
+                    .getImageData(0, 0, c.width, c.height).data.buffer;
+                out[k] = new Uint8Array(await callExportWorker({ type: 'png', buf, w: c.width, h: c.height }, [buf]));
+            }
+            return out;
+        };
+        // Eviction runs asynchronously (encode in the export worker) so jumping across the
+        // timeline never stalls on multi-frame PNG encodes. The finalize step re-checks that
+        // the frame was not touched, promoted, or protected while the encode was in flight;
+        // if it was, the frame simply stays live and a later eviction pass retries.
+        const evictingFrames = new Set();
+        const evictFrame = async (frameId) => {
+            const cells = cellStore.get(frameId);
+            if (!cells) return;
+            evictingFrames.add(frameId);
+            const tick = cellLru.get(frameId) || 0;
+            try {
+                const bytes = await encodeFrameCellsAsync(cells);
+                if (cellStore.get(frameId) === cells &&
+                    (cellLru.get(frameId) || 0) === tick &&
+                    !protectedFrameIds().has(frameId)) {
+                    dormantStore.set(frameId, bytes);
+                    for (const k in cells) { cells[k].width = 0; cells[k].height = 0; } // free backing store
+                    cellStore.delete(frameId);
+                }
+            } catch (_) {
+                // Encode failed: keep the frame live (worse memory, never data loss).
+            } finally {
+                evictingFrames.delete(frameId);
+            }
+        };
         // Evict least-recently-used live frames (outside the protected set) once over budget.
         const evictIfNeeded = () => {
-            if (cellStore.size <= DECODE_BUDGET) return;
+            if (cellStore.size - evictingFrames.size <= DECODE_BUDGET) return;
             const keep = protectedFrameIds();
             const candidates = [...cellStore.keys()]
-                .filter(id => !keep.has(id))
+                .filter(id => !keep.has(id) && !evictingFrames.has(id))
                 .sort((a, b) => (cellLru.get(a) || 0) - (cellLru.get(b) || 0));
-            let overflow = cellStore.size - DECODE_BUDGET;
+            let overflow = cellStore.size - evictingFrames.size - DECODE_BUDGET;
             for (const id of candidates) {
                 if (overflow <= 0) break;
-                const cells = cellStore.get(id);
-                dormantStore.set(id, encodeFrameCells(cells));
-                for (const k in cells) { cells[k].width = 0; cells[k].height = 0; } // free backing store
-                cellStore.delete(id);
+                evictFrame(id);
                 overflow--;
+            }
+        };
+        // --- Playback prefetch ---
+        // ensureFrameLive decodes synchronously on demand, which stutters during playback once
+        // frames have been evicted. Prefetch decodes upcoming frames in the export worker and
+        // promotes them during the inter-frame gap, so the playhead lands on live cells.
+        const prefetchingFrames = new Set();
+        const prefetchFrame = async (frameId) => {
+            if (cellStore.has(frameId) || prefetchingFrames.has(frameId) || !dormantStore.has(frameId)) return;
+            const w = await getExportWorker();
+            if (!w) return; // no worker: the on-demand sync decode path still works
+            if (cellStore.has(frameId) || !dormantStore.has(frameId)) return;
+            prefetchingFrames.add(frameId);
+            try {
+                const bytes = dormantStore.get(frameId);
+                const payload = {};
+                const transfers = [];
+                for (const k in bytes) {
+                    const copy = bytes[k].slice(); // transfer a copy; dormant bytes stay intact
+                    payload[k] = copy.buffer;
+                    transfers.push(copy.buffer);
+                }
+                const decoded = await callExportWorker({ type: 'decode', layers: payload }, transfers);
+                if (cellStore.has(frameId) || !dormantStore.has(frameId)) return; // promoted/gone meanwhile
+                const cells = {};
+                for (const k in decoded) {
+                    const d = decoded[k];
+                    const cnv = makeSurface(d.w, d.h);
+                    cnv.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(d.buf), d.w, d.h), 0, 0);
+                    cells[k] = cnv;
+                }
+                cellStore.set(frameId, cells);
+                dormantStore.delete(frameId);
+                touchFrame(frameId);
+            } catch (_) {
+                // Decode failed here: ensureFrameLive will decode it synchronously instead.
+            } finally {
+                prefetchingFrames.delete(frameId);
+            }
+        };
+        const prefetchPlaybackFrames = (fromIdx) => {
+            const n = project.frames.length;
+            if (n === 0) return;
+            for (let k = 1; k <= PLAYBACK_LOOKAHEAD; k++) {
+                const f = project.frames[(fromIdx + k) % n];
+                if (f) prefetchFrame(f.id);
             }
         };
         // Guarantee a frame's cells are decoded and resident; returns the live cell set or null
@@ -2738,8 +2831,10 @@ const createAppInstance = () => createApp({
                 // Current world coord under cursor (invert current pan/zoom)
                 const worldPt = getPointerPos(e);
 
-                const delta = -Math.sign(e.deltaY) * 0.1;
-                const newZoom = Math.max(0.1, Math.min(10.0, viewport.zoom + delta));
+                // Multiplicative zoom: constant perceptual step at every magnification
+                // (a linear +0.1 is a 100% jump at 0.1x but a 1% jump at 10x).
+                const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+                const newZoom = Math.max(0.1, Math.min(10.0, viewport.zoom * factor));
 
                 // Adjust pan to keep the same world point under the cursor
                 const screenX = viewport.pan.x + worldPt.x * viewport.zoom;
@@ -3094,6 +3189,134 @@ const createAppInstance = () => createApp({
             }
         };
 
+        // --- Touch-friendly frame strip (HTML5 drag&drop never fires on touch) ---
+        // One pointer interaction on a frame card resolves to exactly one of:
+        //   tap                     -> gotoFrame
+        //   horizontal swipe        -> scroll the strip (native pan is disabled by touch-action)
+        //   long-press then move    -> reorder drag (same semantics as mouse drag&drop)
+        //   long-press, no move     -> frame context menu
+        const FRAME_LONGPRESS_MS = 300;
+        const FRAME_DRAG_SLOP = 8;
+        const touchDrag = {
+            pointerId: null, index: null, el: null,
+            startX: 0, startY: 0, lastX: 0,
+            timer: null, mode: 'pending', moved: false
+        };
+        // Opening the context menu from pointerup would be instantly closed by the synthetic
+        // click that follows; the global click handler skips exactly one click when set.
+        let ignoreNextGlobalClick = false;
+        const armGlobalClickBypass = () => {
+            ignoreNextGlobalClick = true;
+            setTimeout(() => { ignoreNextGlobalClick = false; }, 400);
+        };
+
+        const frameIndexAtPoint = (clientX) => {
+            const strip = frameStripRef.value;
+            if (!strip) return null;
+            const cards = strip.querySelectorAll('.frame-card');
+            if (!cards.length) return null;
+            for (let i = 0; i < cards.length; i++) {
+                const r = cards[i].getBoundingClientRect();
+                if (clientX < r.left + r.width / 2) return i;
+            }
+            return cards.length - 1;
+        };
+
+        const reorderFrame = async (fromIdx, toIdx) => {
+            if (session.isPlaying) return;
+            if (!Number.isInteger(fromIdx) || !Number.isInteger(toIdx) || fromIdx === toIdx) return;
+            if (fromIdx < 0 || fromIdx >= project.frames.length) return;
+            if (toIdx < 0 || toIdx >= project.frames.length) return;
+            await commitFloatingSelection();
+            recordStructural();
+            const item = project.frames[fromIdx];
+            project.frames.splice(fromIdx, 1);
+            project.frames.splice(toIdx, 0, item);
+            session.currentFrameIndex = toIdx; // Follow the frame
+            renderCurrentFrame();
+        };
+
+        const resetTouchDrag = () => {
+            if (touchDrag.timer) { clearTimeout(touchDrag.timer); touchDrag.timer = null; }
+            if (touchDrag.el) touchDrag.el.classList.remove('touch-dragging');
+            touchDrag.pointerId = null;
+            touchDrag.el = null;
+            touchDrag.mode = 'pending';
+            touchDrag.moved = false;
+            session.dragOverIndex = null;
+        };
+
+        const cardHandlers = {
+            down(e, idx) {
+                if (e.pointerType === 'mouse') return; // mouse keeps native DnD/click/contextmenu
+                if (touchDrag.pointerId !== null) return; // second finger: ignore
+                e.preventDefault(); // suppress the compatibility click & native long-press menu
+                touchDrag.pointerId = e.pointerId;
+                touchDrag.index = idx;
+                touchDrag.el = e.currentTarget;
+                touchDrag.startX = e.clientX;
+                touchDrag.startY = e.clientY;
+                touchDrag.lastX = e.clientX;
+                touchDrag.mode = 'pending';
+                touchDrag.moved = false;
+                touchDrag.timer = setTimeout(() => {
+                    touchDrag.timer = null;
+                    if (touchDrag.mode === 'pending') {
+                        touchDrag.mode = 'drag';
+                        if (touchDrag.el) touchDrag.el.classList.add('touch-dragging');
+                    }
+                }, FRAME_LONGPRESS_MS);
+                try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+            },
+            move(e) {
+                if (e.pointerId !== touchDrag.pointerId) return;
+                const strip = frameStripRef.value;
+                if (touchDrag.mode === 'pending') {
+                    const dist = Math.hypot(e.clientX - touchDrag.startX, e.clientY - touchDrag.startY);
+                    if (dist > FRAME_DRAG_SLOP) {
+                        if (touchDrag.timer) { clearTimeout(touchDrag.timer); touchDrag.timer = null; }
+                        touchDrag.mode = 'scroll';
+                    }
+                }
+                if (touchDrag.mode === 'scroll') {
+                    if (strip) strip.scrollLeft -= (e.clientX - touchDrag.lastX);
+                    touchDrag.moved = true;
+                } else if (touchDrag.mode === 'drag') {
+                    if (Math.hypot(e.clientX - touchDrag.startX, e.clientY - touchDrag.startY) > FRAME_DRAG_SLOP) {
+                        touchDrag.moved = true;
+                    }
+                    session.dragOverIndex = frameIndexAtPoint(e.clientX);
+                    if (strip) { // nudge the strip when dragging near its edges
+                        const r = strip.getBoundingClientRect();
+                        if (e.clientX < r.left + 30) strip.scrollLeft -= 8;
+                        else if (e.clientX > r.right - 30) strip.scrollLeft += 8;
+                    }
+                }
+                touchDrag.lastX = e.clientX;
+            },
+            async up(e) {
+                if (e.pointerId !== touchDrag.pointerId) return;
+                const { mode, moved, index } = touchDrag;
+                const dropIdx = mode === 'drag' ? frameIndexAtPoint(e.clientX) : null;
+                const menuX = e.clientX, menuY = e.clientY;
+                resetTouchDrag();
+                if (mode === 'drag') {
+                    if (moved && dropIdx !== null && dropIdx !== index) {
+                        await reorderFrame(index, dropIdx);
+                    } else if (!moved) {
+                        armGlobalClickBypass();
+                        actions.handleFrameContext({ clientX: menuX, clientY: menuY }, index);
+                    }
+                } else if (mode === 'pending' && !moved) {
+                    actions.gotoFrame(index); // tap (click was suppressed by preventDefault)
+                }
+            },
+            cancel(e) {
+                if (e.pointerId !== touchDrag.pointerId) return;
+                resetTouchDrag();
+            }
+        };
+
         // Ensure drawing ends even if the pointer is released outside the canvas
         const handleGlobalPointerRelease = (e) => {
             if (!session.isDrawing) return;
@@ -3276,6 +3499,9 @@ const createAppInstance = () => createApp({
             },
 
             handleFrameContext(e, idx) {
+                // A touch interaction is in progress: the browser's long-press contextmenu
+                // would race our own long-press handling (cardHandlers decides on pointerup).
+                if (touchDrag.pointerId !== null) return;
                 frameContext.visible = true;
                 frameContext.x = e.clientX;
                 frameContext.y = e.clientY;
@@ -3404,6 +3630,7 @@ const createAppInstance = () => createApp({
                         resetAllHistory();
                         await nextTick();
                         renderCurrentFrame();
+                        evictIfNeeded(); // the legacy (non-PNG) path decodes frames live
                         updateHistoryState();
 	                        showToast('Project loaded!', 'success');
 	                    } catch (err) {
@@ -3600,19 +3827,8 @@ const createAppInstance = () => createApp({
             },
 
             async handleDrop(e, idx) {
-                if (session.isPlaying) return;
-                await commitFloatingSelection();
                 const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
-                if (!Number.isInteger(fromIdx) || fromIdx === idx) return;
-                if (fromIdx < 0 || fromIdx >= project.frames.length) return;
-
-                recordStructural();
-                const item = project.frames[fromIdx];
-                project.frames.splice(fromIdx, 1);
-                project.frames.splice(idx, 0, item);
-
-                session.currentFrameIndex = idx; // Follow the frame
-                renderCurrentFrame();
+                await reorderFrame(fromIdx, idx);
             },
 
             async insertEmptyFrame(idx) {
@@ -3729,6 +3945,7 @@ const createAppInstance = () => createApp({
                     if (next >= project.frames.length) next = 0;
                     session.currentFrameIndex = next;
                     renderCurrentFrame();
+                    prefetchPlaybackFrames(next); // decode upcoming frames off-thread
                     if (session.isPlaying) playLoop();
                 });
             }, 1000 / getSafeFps());
@@ -3780,7 +3997,20 @@ const createAppInstance = () => createApp({
                         self.postMessage({ id: m.id, ok: true });
                         return;
                     }
-                    if (m.type === 'apng') {
+                    if (m.type === 'png') {
+                        const png = UPNG.encode([m.buf], m.w, m.h, 0); // lossless single frame
+                        self.postMessage({ id: m.id, ok: true, result: png }, [png]);
+                    } else if (m.type === 'decode') {
+                        const out = {};
+                        const transfers = [];
+                        for (const k in m.layers) {
+                            const img = UPNG.decode(m.layers[k]);
+                            const buf = UPNG.toRGBA8(img)[0];
+                            out[k] = { w: img.width, h: img.height, buf };
+                            transfers.push(buf);
+                        }
+                        self.postMessage({ id: m.id, ok: true, result: out }, transfers);
+                    } else if (m.type === 'apng') {
                         const png = UPNG.encode(m.frames, m.w, m.h, 0, m.delays);
                         self.postMessage({ id: m.id, ok: true, result: png }, [png]);
                     } else if (m.type === 'zip') {
@@ -4008,6 +4238,27 @@ const createAppInstance = () => createApp({
             session.colors.secondary = temp;
         };
 
+        // The viewport element's LAYOUT box (w×h) is flex-centered in the workspace while the
+        // transform scales from origin 0 0, so keeping the canvas visually centered at zoom z
+        // needs pan = (1-z) * size/2 on each axis.
+        const setViewportZoom = (z) => {
+            const zoom = Math.max(0.1, Math.min(10.0, z));
+            viewport.zoom = zoom;
+            viewport.pan.x = (1 - zoom) * project.meta.width / 2;
+            viewport.pan.y = (1 - zoom) * project.meta.height / 2;
+        };
+        const fitViewport = () => {
+            const ws = workspaceRef.value;
+            if (!ws) return;
+            const r = ws.getBoundingClientRect();
+            const margin = 40;
+            setViewportZoom(Math.min(
+                (r.width - margin) / project.meta.width,
+                (r.height - margin) / project.meta.height
+            ));
+        };
+        const resetViewport = () => setViewportZoom(1);
+
 	        const openNewProjectModal = () => {
 	            newProjectForm.title = 'Untitled';
 	            newProjectForm.width = project.meta.width;
@@ -4164,6 +4415,23 @@ const createAppInstance = () => createApp({
         };
 
         // --- Lifecycle & Shortcuts ---
+        // Window-level listeners are registered through addWin so a remount (mountApp
+        // unmounts + recreates the app) doesn't stack duplicate handlers.
+        const winListeners = [];
+        const addWin = (type, fn, opts) => {
+            window.addEventListener(type, fn, opts);
+            winListeners.push([type, fn, opts]);
+        };
+        onUnmounted(() => {
+            for (const [type, fn, opts] of winListeners) window.removeEventListener(type, fn, opts);
+            winListeners.length = 0;
+            if (selectionAnimationFrame !== null) {
+                cancelAnimationFrame(selectionAnimationFrame);
+                selectionAnimationFrame = null;
+            }
+            if (thumbTimer) { clearTimeout(thumbTimer); thumbTimer = null; }
+        });
+
         onMounted(async () => {
             // Auto-fit the chrome (toolbar/panels/header/timeline) to the viewport so the app
             // stays usable on smaller screens. Below the reference size we shrink proportionally
@@ -4174,7 +4442,7 @@ const createAppInstance = () => createApp({
                 document.documentElement.style.setProperty('--ui-scale', s.toFixed(3));
             };
             applyUiScale();
-            window.addEventListener('resize', applyUiScale);
+            addWin('resize', applyUiScale);
 
             // Load latest project or init
             const db = await dbPromise;
@@ -4194,12 +4462,15 @@ const createAppInstance = () => createApp({
             renderCurrentFrame();
             updateHistoryState();
 
-            // Keybindings
-            window.addEventListener('keydown', async (e) => {
+            // Keybindings. Plain tool/navigation keys must not fire with a modifier held,
+            // otherwise browser combos (Ctrl+B etc.) would also switch tools.
+            addWin('keydown', async (e) => {
                 if (e.target.tagName === 'INPUT') return;
+                const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
 
                 switch (e.key.toLowerCase()) {
                     case ' ':
+                        if (!plain) break;
                         e.preventDefault();
                         actions.togglePlay();
                         break;
@@ -4207,10 +4478,10 @@ const createAppInstance = () => createApp({
                         if (e.ctrlKey || e.metaKey) {
                             e.preventDefault();
                             if (e.shiftKey) {
-																	redo();
-	                            }else {
-																	undo();
-															}
+                                redo();
+                            } else {
+                                undo();
+                            }
                         }
                         break;
                     case 'y':
@@ -4235,27 +4506,27 @@ const createAppInstance = () => createApp({
                         if (e.ctrlKey || e.metaKey) {
                             e.preventDefault();
                             await actions.paste();
-                        } else {
+                        } else if (plain) {
                             await setTool('move');
                         }
                         break;
                     case 'b':
-                        await setTool('pen');
+                        if (plain) await setTool('pen');
                         break;
                     case 'e':
-                        await setTool('eraser');
+                        if (plain) await setTool('eraser');
                         break;
                     case 'g':
-                        await setTool('bucket');
+                        if (plain) await setTool('bucket');
                         break;
                     case 'i':
-                        await setTool('eyedropper');
+                        if (plain) await setTool('eyedropper');
                         break;
                     case 'm':
-                        await setTool('select-rect');
+                        if (plain) await setTool('select-rect');
                         break;
                     case 'l':
-                        await setTool('select-lasso');
+                        if (plain) await setTool('select-lasso');
                         break;
                     case 'h':
                         if (e.ctrlKey || e.metaKey) {
@@ -4265,15 +4536,16 @@ const createAppInstance = () => createApp({
                         break;
 
                     case '[':
-                        actions.adjustBrushSize(-1);
+                        if (plain) actions.adjustBrushSize(-1);
                         break;
                     case ']':
-                        actions.adjustBrushSize(1);
+                        if (plain) actions.adjustBrushSize(1);
                         break;
                     case 'arrowleft':
-                        await actions.prevFrame();
+                        if (plain) await actions.prevFrame();
                         break;
                     case 'arrowright':
+                        if (!plain) break;
                         if (session.currentFrameIndex === project.frames.length - 1) {
                             await actions.addFrame(); // Auto-create next frame
                         } else {
@@ -4281,6 +4553,7 @@ const createAppInstance = () => createApp({
                         }
                         break;
                     case 'delete':
+                        if (!plain) break;
                         // If selection active, clear it. Else delete frame.
                         if (session.selection.active) {
                             actions.clearSelection();
@@ -4296,18 +4569,43 @@ const createAppInstance = () => createApp({
                             await actions.saveProject();
                         }
                         break;
+                    case 'escape':
+                        // Dismiss the topmost transient UI first, then the selection.
+                        if (frameContext.visible) {
+                            frameContext.visible = false;
+                        } else if (showExportModal.value || showNewProjectModal.value ||
+                                   showProjectsModal.value || showSettings.value) {
+                            showExportModal.value = false;
+                            showNewProjectModal.value = false;
+                            showProjectsModal.value = false;
+                            showSettings.value = false;
+                        } else if (session.selection.active) {
+                            actions.clearSelection();
+                        }
+                        break;
                 }
             });
 
-            window.addEventListener('click', () => {
+            addWin('click', () => {
+                if (ignoreNextGlobalClick) {
+                    ignoreNextGlobalClick = false;
+                    return;
+                }
                 frameContext.visible = false;
+            });
+
+            // Unsaved-changes guard (autosave was deliberately removed; this is its complement).
+            addWin('beforeunload', (e) => {
+                if (dirtyFrames.size === 0) return;
+                e.preventDefault();
+                e.returnValue = '';
             });
 
             // Route Ctrl+Z/Y to the area last touched: the timeline bar vs everything else.
             // Timeline history is ephemeral, so only adopt 'timeline' scope when it actually has
             // something to undo/redo; otherwise (e.g. just navigating between frames) stay on
             // 'canvas' so the current frame's drawing history remains reachable.
-            window.addEventListener('pointerdown', (e) => {
+            addWin('pointerdown', (e) => {
                 const overTimeline = e.target.closest && e.target.closest('.timeline');
                 const hasTimelineHistory = histories.timeline.undo.length > 0 || histories.timeline.redo.length > 0;
                 const scope = (overTimeline && hasTimelineHistory) ? 'timeline' : 'canvas';
@@ -4317,24 +4615,44 @@ const createAppInstance = () => createApp({
                 }
             }, true);
 
-            window.addEventListener('pointerup', handleGlobalPointerRelease);
-            window.addEventListener('pointercancel', handleGlobalPointerRelease);
-            window.addEventListener('pointerout', handleViewportPointerExit);
-            window.addEventListener('blur', clearBrushPreview);
+            addWin('pointerup', handleGlobalPointerRelease);
+            addWin('pointercancel', handleGlobalPointerRelease);
+            addWin('pointerout', handleViewportPointerExit);
+            addWin('blur', clearBrushPreview);
 
             // Multi-touch Zoom (Pinch) & Pan (Two-finger scroll) for iPad / Tablet compatibility
             const activePointers = new Map();
 
-            window.addEventListener('pointerdown', (e) => {
+            addWin('pointerdown', (e) => {
                 if (e.pointerType === 'touch' && workspaceRef.value && workspaceRef.value.contains(e.target)) {
                     if (session.isDrawing && e.pointerId !== session.activePointerId) return;
                     activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
                     if (activePointers.size >= 2) {
-                        // Cancel current single-finger drawing safely to prevent stray marks
+                        // Cancel current single-finger drawing safely to prevent stray marks.
+                        // The partial stroke already landed on the layer canvas, so roll the
+                        // affected layers back to the beginPixelEdit snapshot — otherwise the
+                        // stray line gets silently baked into the cells by the NEXT stroke's
+                        // flush, with no undo entry covering it.
                         if (session.isDrawing) {
                             session.isDrawing = false;
+                            if (pendingEdit) {
+                                for (const id in pendingEdit.before) {
+                                    const lctx = getCtx(Number(id));
+                                    if (!lctx) continue;
+                                    lctx.globalCompositeOperation = 'copy';
+                                    lctx.drawImage(pendingEdit.before[id], 0, 0);
+                                    lctx.globalCompositeOperation = 'source-over';
+                                }
+                                // A cancelled move-drag also cut pixels; restore its selection
+                                // snapshot so float + source don't end up duplicated.
+                                if (pendingEdit.selection) restoreSelectionState(pendingEdit.selection);
+                                pendingEdit = null;
+                            }
+                            pendingSelectionBefore = null;
+                            pendingMoveSelectionBefore = null;
                             clearCanvas(getTempCtx());
+                            if (session.selection.active) renderSelectionOverlay();
                             lastPoint = null;
                             smoothedPoint = null;
                             lastStrokeTime = null;
@@ -4347,7 +4665,7 @@ const createAppInstance = () => createApp({
                 }
             });
 
-            window.addEventListener('pointermove', (e) => {
+            addWin('pointermove', (e) => {
                 if (e.pointerType !== 'touch') return;
                 if (activePointers.has(e.pointerId)) {
                     activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -4394,8 +4712,8 @@ const createAppInstance = () => createApp({
                 }
             };
 
-            window.addEventListener('pointerup', handlePointerUpOrCancel);
-            window.addEventListener('pointercancel', handlePointerUpOrCancel);
+            addWin('pointerup', handlePointerUpOrCancel);
+            addWin('pointercancel', handlePointerUpOrCancel);
 
             // Watchers
             watch(() => settings.onionSkin, () => {
@@ -4436,9 +4754,12 @@ const createAppInstance = () => createApp({
             penSmoothingStrength,
             canvasCursor,
             handlers,
+            cardHandlers,
             actions,
             setTool,
             swapColors,
+            fitViewport,
+            resetViewport,
             exportAPNG,
             exportZIP,
             exportWebM,
