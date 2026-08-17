@@ -296,6 +296,8 @@
             position: absolute;
             top: 0; left: 0;
             pointer-events: none; /* Controlled by top canvas */
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
         }
         canvas.interactive { pointer-events: auto; }
 
@@ -2410,6 +2412,11 @@ const createAppInstance = () => createApp({
             return { minX, minY, maxX, maxY };
         };
 
+        const snapSelectionPoint = (point) => ({
+            x: Math.round(point.x),
+            y: Math.round(point.y)
+        });
+
         const extractSelectionImage = () => {
             if (!hasSelectionShape()) return null;
             const ctx = getCtx(session.currentLayerId);
@@ -2497,6 +2504,9 @@ const createAppInstance = () => createApp({
             // Draw path outline if selecting
             if (session.isDrawing && (session.tool.startsWith('select'))) {
                 ctx.save();
+                // Selection coordinates are pixel-aligned. A half-pixel translation puts a
+                // one-canvas-pixel stroke exactly on the backing-store pixel grid.
+                ctx.translate(0.5, 0.5);
                 const drawPath = () => {
                     if (session.tool === 'select-rect') {
                         const {
@@ -2519,14 +2529,14 @@ const createAppInstance = () => createApp({
                 // Solid white background line (1px thick on screen)
                 ctx.setLineDash([]);
                 ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 1 / viewport.zoom;
+                ctx.lineWidth = 1;
                 drawPath();
 
-                // Dashed black overlay line (1px thick on screen)
-                ctx.setLineDash([4 / viewport.zoom, 4 / viewport.zoom]);
+                // Dashed black overlay line
+                ctx.setLineDash([4, 4]);
                 ctx.strokeStyle = '#000000';
-                ctx.lineWidth = 1 / viewport.zoom;
-                ctx.lineDashOffset = -selectionDashOffset / viewport.zoom;
+                ctx.lineWidth = 1;
+                ctx.lineDashOffset = -Math.round(selectionDashOffset);
                 drawPath();
 
                 ctx.restore();
@@ -2539,18 +2549,19 @@ const createAppInstance = () => createApp({
                 }
 
                 ctx.save();
+                ctx.translate(0.5, 0.5);
 
-                // Solid white background line (1px thick on screen)
+                // Solid white background line
                 ctx.setLineDash([]);
                 ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 1 / viewport.zoom;
+                ctx.lineWidth = 1;
                 drawSelectionShape(ctx);
 
-                // Dashed black overlay line (1px thick on screen)
-                ctx.setLineDash([4 / viewport.zoom, 4 / viewport.zoom]);
+                // Dashed black overlay line
+                ctx.setLineDash([4, 4]);
                 ctx.strokeStyle = '#000000';
-                ctx.lineWidth = 1 / viewport.zoom;
-                ctx.lineDashOffset = -selectionDashOffset / viewport.zoom;
+                ctx.lineWidth = 1;
+                ctx.lineDashOffset = -Math.round(selectionDashOffset);
                 drawSelectionShape(ctx);
 
                 ctx.restore();
@@ -2620,6 +2631,7 @@ const createAppInstance = () => createApp({
                 const sourceRect = cloneRect(session.selection.rect);
                 const sourcePath = clonePointList(session.selection.originPath);
                 const bmp = await createImageBitmap(floatingData);
+                ctx.imageSmoothingEnabled = false;
                 ctx.drawImage(bmp, nextPos.x, nextPos.y);
 
                 const dx = nextPos.x - initialPos.x;
@@ -2967,6 +2979,7 @@ const createAppInstance = () => createApp({
                 if (!session.isRightClick && (session.tool === 'select-rect' || session.tool === 'select-lasso')) {
                     if (session.selection.floatingData) await anchorSelection(); // Anchor previous move
                     pendingSelectionBefore = snapshotSelectionState();
+                    const selectionStart = snapSelectionPoint({ x, y });
                     session.selection.active = false;
                     session.selection.floatingData = null;
                     session.selection.originPath = null;
@@ -2974,8 +2987,8 @@ const createAppInstance = () => createApp({
                     session.selection.initialPos = null;
                     session.selection.dirty = false;
                     session.selection.path = [{
-                        x,
-                        y
+                        x: selectionStart.x,
+                        y: selectionStart.y
                     }];
                     return;
                 }
@@ -3063,17 +3076,11 @@ const createAppInstance = () => createApp({
 
                 // Dragging Logic
                 if (session.tool === 'select-rect' && !session.isRightClick) {
-                    lastPoint = {
-                        x,
-                        y
-                    };
+                    lastPoint = snapSelectionPoint({ x, y });
                     clearCanvas(tempCtx);
                     renderSelectionOverlay();
                 } else if (session.tool === 'select-lasso' && !session.isRightClick) {
-                    session.selection.path.push({
-                        x,
-                        y
-                    });
+                    session.selection.path.push(snapSelectionPoint({ x, y }));
                     clearCanvas(tempCtx);
                     renderSelectionOverlay();
                 } else if (session.tool === 'move' && session.selection.active && !session.isRightClick) {
@@ -3151,10 +3158,7 @@ const createAppInstance = () => createApp({
                 if (session.tool === 'select-rect') {
                     const start = session.selection.path[0];
                     const pos = getPointerPos(e); // Use corrected pos
-                    const end = {
-                        x: pos.x,
-                        y: pos.y
-                    };
+                    const end = snapSelectionPoint(pos);
 
                     const w = end.x - start.x;
                     const h = end.y - start.y;
