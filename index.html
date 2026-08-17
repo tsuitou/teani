@@ -1260,6 +1260,7 @@ const createAppInstance = () => createApp({
         let pendingEdit = null;
         let pendingSelectionBefore = null;
         let pendingMoveSelectionBefore = null;
+        let pendingMoveStart = null;
 
         const cloneImageData = (img) => {
             if (!img) return null;
@@ -1355,6 +1356,7 @@ const createAppInstance = () => createApp({
             pendingEdit = null;
             pendingSelectionBefore = null;
             pendingMoveSelectionBefore = null;
+            pendingMoveStart = null;
             updateHistoryState();
         };
 
@@ -2456,7 +2458,19 @@ const createAppInstance = () => createApp({
                     });
                     ctx.closePath();
                     ctx.stroke();
-                } else if (session.selection.floatingData) {
+                } else if (session.selection.rect && session.selection.initialPos) {
+                    // The floating bitmap uses an integer-aligned bounding box, while the
+                    // original selection may start/end on fractional coordinates. Preserve
+                    // that geometry and translate it by the actual move delta.
+                    const dx = session.selection.floatingPos.x - session.selection.initialPos.x;
+                    const dy = session.selection.floatingPos.y - session.selection.initialPos.y;
+                    ctx.strokeRect(
+                        session.selection.rect.x + dx,
+                        session.selection.rect.y + dy,
+                        session.selection.rect.w,
+                        session.selection.rect.h
+                    );
+                } else {
                     ctx.strokeRect(session.selection.floatingPos.x, session.selection.floatingPos.y, session.selection.floatingData.width, session.selection.floatingData.height);
                 }
                 return;
@@ -2600,18 +2614,29 @@ const createAppInstance = () => createApp({
             const tempCtx = getTempCtx();
             if (!ctx) return;
             try {
-                const bmp = await createImageBitmap(session.selection.floatingData);
-                ctx.drawImage(bmp, session.selection.floatingPos.x, session.selection.floatingPos.y);
-
+                const floatingData = session.selection.floatingData;
                 const nextPos = { ...session.selection.floatingPos };
-                const nextRect = session.selection.originPath ? null : {
+                const initialPos = session.selection.initialPos ? { ...session.selection.initialPos } : nextPos;
+                const sourceRect = cloneRect(session.selection.rect);
+                const sourcePath = clonePointList(session.selection.originPath);
+                const bmp = await createImageBitmap(floatingData);
+                ctx.drawImage(bmp, nextPos.x, nextPos.y);
+
+                const dx = nextPos.x - initialPos.x;
+                const dy = nextPos.y - initialPos.y;
+                const nextRect = sourceRect ? {
+                    x: sourceRect.x + dx,
+                    y: sourceRect.y + dy,
+                    w: sourceRect.w,
+                    h: sourceRect.h
+                } : (sourcePath ? null : {
                     x: nextPos.x,
                     y: nextPos.y,
-                    w: session.selection.floatingData.width,
-                    h: session.selection.floatingData.height
-                };
-                const nextPath = session.selection.originPath ?
-                    session.selection.originPath.map(p => ({ x: p.x + nextPos.x, y: p.y + nextPos.y })) :
+                    w: floatingData.width,
+                    h: floatingData.height
+                });
+                const nextPath = sourcePath ?
+                    sourcePath.map(p => ({ x: p.x + nextPos.x, y: p.y + nextPos.y })) :
                     [];
 
                 session.selection.active = true;
@@ -2626,6 +2651,7 @@ const createAppInstance = () => createApp({
                 await saveCurrentLayerToState();
                 renderSelectionOverlay();
                 pendingMoveSelectionBefore = null;
+                pendingMoveStart = null;
             } catch (err) {
                 console.error('anchorSelection failed', err);
             }
@@ -2679,15 +2705,18 @@ const createAppInstance = () => createApp({
 
             const startX = session.selection.initialPos.x;
             const startY = session.selection.initialPos.y;
-            const w = session.selection.floatingData.width;
-            const h = session.selection.floatingData.height;
 
             // Clear source area
             ctx.save();
             ctx.globalCompositeOperation = 'destination-out';
             ctx.beginPath();
             if (session.selection.rect) {
-                ctx.rect(startX, startY, w, h);
+                ctx.rect(
+                    session.selection.rect.x,
+                    session.selection.rect.y,
+                    session.selection.rect.w,
+                    session.selection.rect.h
+                );
             } else {
                 // Reconstruct path at initial position
                 if (session.selection.originPath) {
@@ -2954,6 +2983,7 @@ const createAppInstance = () => createApp({
                 // Move Tool (Left click only)
                 if (!session.isRightClick && session.tool === 'move') {
                     pendingMoveSelectionBefore = null;
+                    pendingMoveStart = null;
                     return;
                 }
 
@@ -3047,12 +3077,28 @@ const createAppInstance = () => createApp({
                     clearCanvas(tempCtx);
                     renderSelectionOverlay();
                 } else if (session.tool === 'move' && session.selection.active && !session.isRightClick) {
-                    if (!pendingMoveSelectionBefore) pendingMoveSelectionBefore = snapshotSelectionState();
-                    ensureSelectionCut(pendingMoveSelectionBefore);
-                    const dx = x - lastPoint.x;
-                    const dy = y - lastPoint.y;
-                    session.selection.floatingPos.x += dx;
-                    session.selection.floatingPos.y += dy;
+                    if (!pendingMoveSelectionBefore) {
+                        pendingMoveSelectionBefore = snapshotSelectionState();
+                        ensureSelectionCut(pendingMoveSelectionBefore);
+                        if (!session.selection.floatingData) {
+                            pendingMoveSelectionBefore = null;
+                            return;
+                        }
+                        pendingMoveStart = {
+                            pointer: { ...lastPoint },
+                            floatingPos: { ...session.selection.floatingPos }
+                        };
+                    }
+                    if (pendingMoveStart) {
+                        // Bitmap movement is pixel-aligned. Calculate from the drag origin so
+                        // sub-pixel pointer deltas at non-100% zoom accumulate instead of being lost.
+                        session.selection.floatingPos.x = Math.round(
+                            pendingMoveStart.floatingPos.x + x - pendingMoveStart.pointer.x
+                        );
+                        session.selection.floatingPos.y = Math.round(
+                            pendingMoveStart.floatingPos.y + y - pendingMoveStart.pointer.y
+                        );
+                    }
                     lastPoint = {
                         x,
                         y
@@ -3150,6 +3196,7 @@ const createAppInstance = () => createApp({
                     pendingSelectionBefore = null;
                 } else if (session.tool === 'move' && pendingMoveSelectionBefore) {
                     pendingMoveSelectionBefore = null;
+                    pendingMoveStart = null;
                 } else if (['pen', 'eraser'].includes(session.tool) || wasRightClick) { // Also save on right click finish
                     const pos = forcePos ? forcePos : getPointerPos(e);
                     const ctx = getCtx(session.currentLayerId);
@@ -3709,14 +3756,17 @@ const createAppInstance = () => createApp({
                     if (ctx) {
                         const startX = session.selection.initialPos.x;
                         const startY = session.selection.initialPos.y;
-                        const w = session.selection.floatingData.width;
-                        const h = session.selection.floatingData.height;
 
                         ctx.save();
                         ctx.globalCompositeOperation = 'destination-out';
                         ctx.beginPath();
                         if (session.selection.rect) {
-                            ctx.rect(startX, startY, w, h);
+                            ctx.rect(
+                                session.selection.rect.x,
+                                session.selection.rect.y,
+                                session.selection.rect.w,
+                                session.selection.rect.h
+                            );
                         } else if (session.selection.originPath) {
                             session.selection.originPath.forEach((p, i) => {
                                 const px = p.x + startX;
@@ -3774,6 +3824,16 @@ const createAppInstance = () => createApp({
                     x: px,
                     y: py
                 };
+                // Clipboard image data has no selection-shape metadata. Treat a paste as a
+                // fresh rectangular selection instead of inheriting the previous selection.
+                session.selection.rect = {
+                    x: px,
+                    y: py,
+                    w: session.clipboard.width,
+                    h: session.clipboard.height
+                };
+                session.selection.path = [];
+                session.selection.originPath = null;
                 session.selection.active = true;
                 session.selection.dirty = true; // Pasted data is always floating (not on source)
 
@@ -4664,6 +4724,7 @@ const createAppInstance = () => createApp({
                             }
                             pendingSelectionBefore = null;
                             pendingMoveSelectionBefore = null;
+                            pendingMoveStart = null;
                             clearCanvas(getTempCtx());
                             if (session.selection.active) renderSelectionOverlay();
                             lastPoint = null;
