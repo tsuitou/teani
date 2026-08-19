@@ -503,7 +503,7 @@
 <div id="app">
     <!-- Header -->
     <header class="header">
-        <div class="header-title"><i class="fas fa-film"></i> tegani </div>
+	    <div class="header-title"><i class="fas fa-film"></i> tegani<span v-if="projectDirty" title="Unsaved changes"> *</span></div>
         <div class="menu-item" @click="openNewProjectModal"><i class="fas fa-file"></i> New</div>
         <div class="menu-item" @click="actions.saveProject()"><i class="fas fa-save"></i> Save</div>
         <div class="menu-item" @click="openProjectsModal"><i class="fas fa-folder-open"></i> Projects</div>
@@ -959,6 +959,7 @@ const {
 /* --- Constants & Utils --- */
 const DB_NAME = 'teganiDB';
 const DB_VERSION = 1; // Incremented for schema change
+const DATA_VERSION = 2; // Stored-project payload version (does not change the IDB schema)
 const DEFAULT_PALETTE = [
     '#000000', '#ffffff', '#7f7f7f', '#c3c3c3', '#880015', '#b97a57',
     '#ed1c24', '#ffaec9', '#ff7f27', '#ffc90e', '#fff200', '#efe4b0',
@@ -1097,6 +1098,7 @@ const createAppInstance = () => createApp({
     setup() {
         // --- State Definitions ---
         const isLoading = ref(false);
+	        const projectDirty = ref(false);
 	        const showSettings = ref(false);
 	        const showNewProjectModal = ref(false);
 	        const showExportModal = ref(false);
@@ -1127,9 +1129,26 @@ const createAppInstance = () => createApp({
         // shape only changes when its pixels or the mask settings change. Cache the masked
         // (pre-tint) surface per frame so navigation between unedited frames costs only a blit.
         const onionMaskCache = new Map(); // frameId -> { sig, w, h, canvas }
+	    const ONION_CACHE_LIMIT = 2;      // only previous/next masks are useful at once
         let onionTintBuffer = null;       // reused scratch for per-call tint composition
-        const invalidateOnion = (frameId) => { if (frameId) onionMaskCache.delete(frameId); };
-        const clearOnionCache = () => onionMaskCache.clear();
+	    const releaseSurface = (surface) => {
+	        if (!surface) return;
+	        surface.width = 0;
+	        surface.height = 0;
+	    };
+	    const releaseCellSet = (cells) => {
+	        for (const surface of Object.values(cells || {})) releaseSurface(surface);
+	    };
+	    const invalidateOnion = (frameId) => {
+	        if (!frameId) return;
+	        const cached = onionMaskCache.get(frameId);
+	        if (cached) releaseSurface(cached.canvas);
+	        onionMaskCache.delete(frameId);
+	    };
+	    const clearOnionCache = () => {
+	        for (const cached of onionMaskCache.values()) releaseSurface(cached.canvas);
+	        onionMaskCache.clear();
+	    };
 
         // Core State
         const project = reactive({
@@ -1202,6 +1221,25 @@ const createAppInstance = () => createApp({
 
         const settings = reactive(cloneDefaultSettings());
 
+	        // Pixel dirtiness controls incremental frame persistence. projectDirty covers the
+	        // complete user-visible document, including metadata, ordering and preferences.
+	        let dirtyTrackingDepth = 0;
+	        const markProjectDirty = () => {
+	            if (dirtyTrackingDepth === 0) projectDirty.value = true;
+	        };
+	        const replaceSettingsState = (loaded = null) => {
+	            const fresh = cloneDefaultSettings();
+	            if (loaded && typeof loaded === 'object') {
+	                Object.assign(fresh, loaded);
+	                fresh.onionSkin = {
+	                    ...cloneDefaultSettings().onionSkin,
+	                    ...(loaded.onionSkin || {})
+	                };
+	            }
+	            Object.keys(settings).forEach(k => delete settings[k]);
+	            Object.assign(settings, fresh);
+	        };
+
 	        const newProjectForm = reactive({
 	            title: "Untitled",
 	            width: 800,
@@ -1255,9 +1293,24 @@ const createAppInstance = () => createApp({
             }
             return out;
         };
+	    const HISTORY_BYTE_BUDGET = 128 * 1024 * 1024;
+	    const selectionStateBytes = (selection) => selection?.floatingData?.data?.byteLength || 0;
+	    const historyEntryBytes = (entry) => {
+	        if (!entry) return 0;
+	        if (entry.type === 'pixel') {
+	            return (entry.patches || []).reduce((sum, patch) => sum + (patch.data?.data?.byteLength || 0), 0) +
+	                selectionStateBytes(entry.selection);
+	        }
+	        if (entry.type === 'selection') return selectionStateBytes(entry.selection);
+	        return 0; // structural entries hold metadata; frame pixels are governed by the cell LRU
+	    };
         const trimStack = (stack) => {
             const limit = getUndoLimit();
             while (stack.length > limit) stack.shift();
+	        let bytes = stack.reduce((sum, entry) => sum + historyEntryBytes(entry), 0);
+	        while (stack.length > 1 && bytes > HISTORY_BYTE_BUDGET) {
+	            bytes -= historyEntryBytes(stack.shift());
+	        }
         };
         let pendingEdit = null;
         let pendingSelectionBefore = null;
@@ -1432,6 +1485,7 @@ const createAppInstance = () => createApp({
             pendingEdit = null;
             if (patches.length) {
                 invalidateOnion(frameId); // edited frame's onion shape is now stale
+	            markProjectDirty();
                 const ch = canvasHistory(frameId);
                 ch.undo.push({ type: 'pixel', frameId, patches, selection });
                 ch.redo = [];
@@ -1501,33 +1555,50 @@ const createAppInstance = () => createApp({
         // window are evicted to compressed PNG bytes (dormant) and decoded back on demand.
         // This caps memory at ~DECODE_BUDGET frames instead of growing with frame count.
         const DECODE_BUDGET = 24;             // max live (decoded) frames
+	    const DECODE_BYTE_BUDGET = 256 * 1024 * 1024; // approximate RGBA backing-store budget
         const PLAYBACK_LOOKAHEAD = 4;         // frames kept ready ahead of the playhead
         const dormantStore = new Map();       // frameId -> { layerId: Uint8Array (PNG) }
         const cellLru = new Map();            // frameId -> last-used tick
         let lruClock = 0;
         const dirtyFrames = new Set();        // frames whose pixels changed since the last save
+	    let storageEpoch = 0;                // invalidates async cache work across project loads
         const touchFrame = (frameId) => { cellLru.set(frameId, ++lruClock); };
+	    const cellSetBytes = (cells) => Object.values(cells || {}).reduce(
+	        (sum, c) => sum + Math.max(0, c.width) * Math.max(0, c.height) * 4,
+	        0
+	    );
+	    const resetCellStorage = () => {
+	        storageEpoch++;
+	        evictionCycle++;
+	        for (const cells of cellStore.values()) releaseCellSet(cells);
+	        cellStore.clear();
+	        dormantStore.clear();
+	        cellLru.clear();
+	        dirtyFrames.clear();
+	        evictingFrames.clear();
+	        evictionPromises.clear();
+	        prefetchingFrames.clear();
+	        frameClipboardCells = null;
+	        thumbnailRefreshToken++;
+	        if (thumbTimer) { clearTimeout(thumbTimer); thumbTimer = null; }
+	    };
 
-        const encodeFrameCells = (cells) => {
-            const out = {};
-            for (const k in cells) {
-                const c = cells[k];
-                const buf = c.getContext('2d', { willReadFrequently: true })
-                    .getImageData(0, 0, c.width, c.height).data.buffer;
-                out[k] = new Uint8Array(UPNG.encode([buf], c.width, c.height, 0)); // lossless
-            }
-            return out;
-        };
         const decodeFrameCells = (bytesSet) => {
             const cells = {};
-            for (const k in bytesSet) {
-                const img = UPNG.decode(bytesSet[k].buffer);
-                const rgba = new Uint8ClampedArray(UPNG.toRGBA8(img)[0]);
-                const cnv = makeSurface(img.width, img.height);
-                cnv.getContext('2d').putImageData(new ImageData(rgba, img.width, img.height), 0, 0);
-                cells[k] = cnv;
-            }
-            return cells;
+	        try {
+	            for (const k in bytesSet) {
+	                assertCompletePng(bytesSet[k]);
+	                const img = UPNG.decode(bytesSet[k].buffer);
+	                const rgba = new Uint8ClampedArray(UPNG.toRGBA8(img)[0]);
+	                const cnv = makeSurface(img.width, img.height);
+	                cells[k] = cnv;
+	                cnv.getContext('2d').putImageData(new ImageData(rgba, img.width, img.height), 0, 0);
+	            }
+	            return cells;
+	        } catch (err) {
+	            releaseCellSet(cells);
+	            throw err;
+	        }
         };
 
         const bytesToBase64 = (bytes) => {
@@ -1552,6 +1623,53 @@ const createAppInstance = () => createApp({
                 return null;
             }
         };
+	    const getPngInfo = (input) => {
+	        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+	        const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+	        if (bytes.length < 33 || !signature.every((v, i) => bytes[i] === v)) return null;
+	        const readU32 = (offset) => (
+	            bytes[offset] * 0x1000000 +
+	            (bytes[offset + 1] << 16) +
+	            (bytes[offset + 2] << 8) +
+	            bytes[offset + 3]
+	        ) >>> 0;
+	        let pos = 8;
+	        let width = null, height = null;
+	        while (pos + 12 <= bytes.length) {
+	            const length = readU32(pos);
+	            const end = pos + 12 + length;
+	            if (!Number.isSafeInteger(end) || end > bytes.length) return null;
+	            const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+	            if (type === 'IHDR') {
+	                if (length !== 13) return null;
+	                width = readU32(pos + 8);
+	                height = readU32(pos + 12);
+	            }
+	            if (type === 'IEND') {
+	                if (length !== 0 || width === null || height === null) return null;
+	                return { width, height };
+	            }
+	            pos = end;
+	        }
+	        return null;
+	    };
+	    const assertCompletePng = (bytes, expectedWidth = null, expectedHeight = null) => {
+	        const info = getPngInfo(bytes);
+	        if (!info || (expectedWidth !== null && info.width !== expectedWidth) ||
+	            (expectedHeight !== null && info.height !== expectedHeight)) {
+	            throw new Error('PNG encoding produced an incomplete or incorrectly sized image.');
+	        }
+	    };
+	    const canvasToPngBytes = async (canvas) => {
+	        if (!canvas || canvas.width <= 0 || canvas.height <= 0) throw new Error('Cannot encode an empty canvas.');
+	        const width = canvas.width, height = canvas.height;
+	        const blob = await new Promise((resolve, reject) => {
+	            canvas.toBlob(result => result ? resolve(result) : reject(new Error('Canvas PNG encoding failed.')), 'image/png');
+	        });
+	        const bytes = new Uint8Array(await blob.arrayBuffer());
+	        assertCompletePng(bytes, width, height);
+	        return bytes;
+	    };
 
         // Frame ids that must stay decoded: current, onion neighbours, and playback lookahead.
         const protectedFrameIds = () => {
@@ -1563,55 +1681,81 @@ const createAppInstance = () => createApp({
             if (session.isPlaying) for (let k = 1; k <= PLAYBACK_LOOKAHEAD; k++) add(ci + k);
             return ids;
         };
-        // PNG-encode a frame's cells off the main thread (falls back to sync when no worker).
-        const encodeFrameCellsAsync = async (cells) => {
-            const w = await getExportWorker();
-            if (!w) return encodeFrameCells(cells);
-            const out = {};
-            for (const k in cells) {
-                const c = cells[k];
-                const buf = c.getContext('2d', { willReadFrequently: true })
-                    .getImageData(0, 0, c.width, c.height).data.buffer;
-                out[k] = new Uint8Array(await callExportWorker({ type: 'png', buf, w: c.width, h: c.height }, [buf]));
-            }
-            return out;
-        };
-        // Eviction runs asynchronously (encode in the export worker) so jumping across the
-        // timeline never stalls on multi-frame PNG encodes. The finalize step re-checks that
-        // the frame was not touched, promoted, or protected while the encode was in flight;
-        // if it was, the frame simply stays live and a later eviction pass retries.
+	    // Evictions are serialized. Native canvas PNG encoding avoids UPNG's fixed output-buffer
+	    // ceiling, and one-at-a-time execution prevents simultaneous full-frame readback spikes.
         const evictingFrames = new Set();
-        const evictFrame = async (frameId) => {
-            const cells = cellStore.get(frameId);
-            if (!cells) return;
-            evictingFrames.add(frameId);
-            const tick = cellLru.get(frameId) || 0;
-            try {
-                const bytes = await encodeFrameCellsAsync(cells);
-                if (cellStore.get(frameId) === cells &&
-                    (cellLru.get(frameId) || 0) === tick &&
-                    !protectedFrameIds().has(frameId)) {
-                    dormantStore.set(frameId, bytes);
-                    for (const k in cells) { cells[k].width = 0; cells[k].height = 0; } // free backing store
-                    cellStore.delete(frameId);
-                }
-            } catch (_) {
-                // Encode failed: keep the frame live (worse memory, never data loss).
-            } finally {
-                evictingFrames.delete(frameId);
-            }
-        };
+	    const evictionPromises = new Map();
+	    let evictionQueue = Promise.resolve();
+	    let evictionPauseDepth = 0;
+	    let evictionCycle = 0;
+	    const evictFrame = async (frameId, cells, epoch, tick, cycle) => {
+	        if (cycle !== evictionCycle || epoch !== storageEpoch || cellStore.get(frameId) !== cells ||
+	            (cellLru.get(frameId) || 0) !== tick || protectedFrameIds().has(frameId)) return;
+	        try {
+	            const bytes = {};
+	            for (const k in cells) {
+	                if (cycle !== evictionCycle || epoch !== storageEpoch || cellStore.get(frameId) !== cells ||
+	                    (cellLru.get(frameId) || 0) !== tick || protectedFrameIds().has(frameId)) return;
+	                bytes[k] = await canvasToPngBytes(cells[k]);
+	            }
+	            if (cycle === evictionCycle && epoch === storageEpoch && cellStore.get(frameId) === cells &&
+	                (cellLru.get(frameId) || 0) === tick && !protectedFrameIds().has(frameId)) {
+	                dormantStore.set(frameId, bytes);
+	                releaseCellSet(cells);
+	                cellStore.delete(frameId);
+	            }
+	        } catch (err) {
+	            // Keep the authoritative canvases if encoding or validation fails.
+	            console.warn('Frame eviction skipped:', err);
+	        }
+	    };
+	    const scheduleEviction = (frameId) => {
+	        if (evictionPauseDepth > 0 || evictionPromises.has(frameId)) return evictionPromises.get(frameId) || null;
+	        const cells = cellStore.get(frameId);
+	        if (!cells) return null;
+	        const epoch = storageEpoch;
+	        const tick = cellLru.get(frameId) || 0;
+	        const cycle = evictionCycle;
+	        evictingFrames.add(frameId);
+	        const job = evictionQueue.catch(() => {}).then(() => evictFrame(frameId, cells, epoch, tick, cycle));
+	        evictionQueue = job;
+	        evictionPromises.set(frameId, job);
+	        const cleanup = () => {
+	            if (evictionPromises.get(frameId) === job) {
+	                evictionPromises.delete(frameId);
+	                evictingFrames.delete(frameId);
+	            }
+	        };
+	        job.then(cleanup, cleanup);
+	        return job;
+	    };
+	    const withEvictionPaused = async (callback) => {
+	        evictionPauseDepth++;
+	        evictionCycle++; // queued work becomes a cheap no-op; only an active toBlob must finish
+	        try {
+	            await Promise.all([...evictionPromises.values()]);
+	            return await callback();
+	        } finally {
+	            evictionPauseDepth--;
+	            if (evictionPauseDepth === 0) evictIfNeeded();
+	        }
+	    };
         // Evict least-recently-used live frames (outside the protected set) once over budget.
         const evictIfNeeded = () => {
-            if (cellStore.size - evictingFrames.size <= DECODE_BUDGET) return;
+	        if (evictionPauseDepth > 0) return;
+	        let liveBytes = [...cellStore.entries()].reduce(
+	            (sum, [id, cells]) => sum + (evictingFrames.has(id) ? 0 : cellSetBytes(cells)), 0
+	        );
+	        if (cellStore.size - evictingFrames.size <= DECODE_BUDGET && liveBytes <= DECODE_BYTE_BUDGET) return;
             const keep = protectedFrameIds();
             const candidates = [...cellStore.keys()]
                 .filter(id => !keep.has(id) && !evictingFrames.has(id))
                 .sort((a, b) => (cellLru.get(a) || 0) - (cellLru.get(b) || 0));
-            let overflow = cellStore.size - evictingFrames.size - DECODE_BUDGET;
+	        let overflow = cellStore.size - evictingFrames.size - DECODE_BUDGET;
             for (const id of candidates) {
-                if (overflow <= 0) break;
-                evictFrame(id);
+	            if (overflow <= 0 && liveBytes <= DECODE_BYTE_BUDGET) break;
+	            liveBytes -= cellSetBytes(cellStore.get(id));
+	            scheduleEviction(id);
                 overflow--;
             }
         };
@@ -1622,9 +1766,10 @@ const createAppInstance = () => createApp({
         const prefetchingFrames = new Set();
         const prefetchFrame = async (frameId) => {
             if (cellStore.has(frameId) || prefetchingFrames.has(frameId) || !dormantStore.has(frameId)) return;
-            const w = await getExportWorker();
+	        const epoch = storageEpoch;
+	        const w = await getExportWorker();
             if (!w) return; // no worker: the on-demand sync decode path still works
-            if (cellStore.has(frameId) || !dormantStore.has(frameId)) return;
+	        if (epoch !== storageEpoch || cellStore.has(frameId) || !dormantStore.has(frameId)) return;
             prefetchingFrames.add(frameId);
             try {
                 const bytes = dormantStore.get(frameId);
@@ -1636,7 +1781,7 @@ const createAppInstance = () => createApp({
                     transfers.push(copy.buffer);
                 }
                 const decoded = await callExportWorker({ type: 'decode', layers: payload }, transfers);
-                if (cellStore.has(frameId) || !dormantStore.has(frameId)) return; // promoted/gone meanwhile
+	            if (epoch !== storageEpoch || cellStore.has(frameId) || !dormantStore.has(frameId)) return; // promoted/gone meanwhile
                 const cells = {};
                 for (const k in decoded) {
                     const d = decoded[k];
@@ -1706,6 +1851,7 @@ const createAppInstance = () => createApp({
                 const old = s;
                 s = makeSurface(w, h);
                 s.getContext('2d').drawImage(old, 0, 0);
+	            releaseSurface(old);
                 cells[layerId] = s;
             }
             return s;
@@ -1731,17 +1877,22 @@ const createAppInstance = () => createApp({
         let frameClipboardCells = null;
 
         // --- Cell (de)serialization for persistence (PNG bytes at the I/O boundary) ---
-        const encodeCellToBlob = (canvas) => new Promise(res => canvas.toBlob(b => res(b), 'image/png'));
         // Dormant frames are already PNG bytes — wrap them straight into a Blob so saving does
         // not force a decode (keeps far frames out of memory during a full save).
         const serializeFrameCells = async (frame) => {
             const layers = {};
             if (cellStore.has(frame.id)) {
                 const src = cellStore.get(frame.id);
-                for (const k in src) layers[k] = await encodeCellToBlob(src[k]);
+	            for (const k in src) {
+	                const bytes = await canvasToPngBytes(src[k]);
+	                layers[k] = new Blob([bytes], { type: 'image/png' });
+	            }
             } else if (dormantStore.has(frame.id)) {
                 const bytes = dormantStore.get(frame.id);
-                for (const k in bytes) layers[k] = new Blob([bytes[k]], { type: 'image/png' });
+	            for (const k in bytes) {
+	                assertCompletePng(bytes[k], project.meta.width, project.meta.height);
+	                layers[k] = new Blob([bytes[k]], { type: 'image/png' });
+	            }
             }
             return { id: frame.id, layers, thumbnail: frame.thumbnail || null };
         };
@@ -1762,12 +1913,17 @@ const createAppInstance = () => createApp({
             });
             scan(histories.timeline.undo);
             scan(histories.timeline.redo);
-            for (const id of [...cellStore.keys()]) if (!live.has(id)) cellStore.delete(id);
+            for (const id of [...cellStore.keys()]) {
+	            if (!live.has(id)) {
+	                releaseCellSet(cellStore.get(id));
+	                cellStore.delete(id);
+	            }
+	        }
             for (const id of [...dormantStore.keys()]) if (!live.has(id)) dormantStore.delete(id);
             for (const id of [...cellLru.keys()]) if (!live.has(id)) cellLru.delete(id);
             // A frame that is gone for good also loses its per-frame undo history.
             for (const id of [...canvasHistories.keys()]) if (!live.has(id)) canvasHistories.delete(id);
-            for (const id of [...onionMaskCache.keys()]) if (!live.has(id)) onionMaskCache.delete(id);
+            for (const id of [...onionMaskCache.keys()]) if (!live.has(id)) invalidateOnion(id);
         };
 
         const resetSessionState = () => {
@@ -1817,6 +1973,7 @@ const createAppInstance = () => createApp({
             const ctx = c.getContext('2d');
 
             const cells = peekFrameCells(frame.id) || {};
+	        const transientCells = !cellStore.has(frame.id);
             for (const l of project.layers) {
                 if (l.type !== 'draw') continue;
                 if (!l.visible) continue;
@@ -1829,6 +1986,7 @@ const createAppInstance = () => createApp({
                     ctx.fillRect(0, 0, w, h);
                 }
             }
+	        if (transientCells) releaseCellSet(cells);
             return c.toDataURL('image/jpeg', 0.8);
         };
 
@@ -1858,12 +2016,11 @@ const createAppInstance = () => createApp({
             ctx.clearRect(0, 0, project.meta.width, project.meta.height);
         };
 
-        // A frame is just metadata now; pixel cells are created lazily in the cell store.
-        // Ensure every layer's surface exists so onion/thumbnail of untouched frames work.
+	    // A frame is metadata only until a layer is edited or decoded. Blank layers must not
+	    // allocate full-size backing canvases merely because a frame was created or visited.
         const normalizeFrame = (frame) => {
             if (!frame) return;
             if (!frame.id) frame.id = generateUUID();
-            project.layers.forEach(l => cellSurface(frame, l.id));
         };
 
         const ensureFrame = (idx) => {
@@ -1893,12 +2050,21 @@ const createAppInstance = () => createApp({
             const bgCtx = canvasBg.value.getContext('2d');
             if (bgCtx) bgCtx.clearRect(0, 0, w, h);
 
-            for (const layer of drawingLayers.value) {
+	        const cells = ensureFrameLive(frame.id) || {};
+	        for (const layer of drawingLayers.value) {
                 const ctx = getCtx(layer.id);
                 if (!ctx) continue;
-                const surface = cellSurface(frame, layer.id);
-                ctx.globalCompositeOperation = 'copy';
-                ctx.drawImage(surface, 0, 0);
+	            const surface = cells[layer.id];
+	            ctx.globalCompositeOperation = 'copy';
+	            if (surface) {
+	                ctx.drawImage(surface, 0, 0);
+	            } else {
+	                ctx.clearRect(0, 0, w, h);
+	                if (layer.id === 0) {
+	                    ctx.fillStyle = settings.backgroundColor || '#FFFFFF';
+	                    ctx.fillRect(0, 0, w, h);
+	                }
+	            }
                 ctx.globalCompositeOperation = 'source-over';
             }
 
@@ -1908,8 +2074,11 @@ const createAppInstance = () => createApp({
         };
 
         // Copy the visible working canvases of a frame back into its authoritative cells.
-        const flushFrameCells = (frame) => {
-            for (const l of drawingLayers.value) {
+	    const flushFrameCells = (frame, layerIds = null) => {
+	        const existing = cellStore.get(frame.id) || {};
+	        const ids = layerIds ? new Set(layerIds.map(Number)) : new Set(Object.keys(existing).map(Number));
+	        for (const l of drawingLayers.value) {
+	            if (!ids.has(l.id)) continue;
                 const cvs = canvasRefs.value[l.id];
                 if (!cvs) continue;
                 const surface = cellSurface(frame, l.id);
@@ -1963,7 +2132,8 @@ const createAppInstance = () => createApp({
             ensureFrame(session.currentFrameIndex);
             const frame = currentFrame.value;
             if (!frame) return;
-            flushFrameCells(frame);
+	        const editedLayerIds = pendingEdit ? Object.keys(pendingEdit.before).map(Number) : [session.currentLayerId];
+	        flushFrameCells(frame, editedLayerIds);
             commitPixelEdit();
             scheduleThumbnail(frame);
         };
@@ -1992,6 +2162,7 @@ const createAppInstance = () => createApp({
         // add / delete / insert / paste / reorder frames. Goes to the timeline scope.
         const recordStructural = () => {
             if (session.isPlaying) return;
+	        markProjectDirty();
             histories.timeline.undo.push({
                 type: 'structural',
                 order: project.frames.slice(),
@@ -2008,6 +2179,7 @@ const createAppInstance = () => createApp({
             if (entry.type === 'pixel') {
                 const idx = project.frames.findIndex(f => f.id === entry.frameId);
                 if (idx === -1) return null; // Frame no longer exists (e.g. structurally removed); skip
+	            markProjectDirty();
                 session.currentFrameIndex = idx;
                 const frame = project.frames[idx];
                 const inverseSelection = snapshotSelectionState();
@@ -2033,6 +2205,8 @@ const createAppInstance = () => createApp({
             if (entry.type === 'selection') {
                 const idx = project.frames.findIndex(f => f.id === entry.frameId);
                 if (idx === -1) return null;
+	            // Selection-only history is ephemeral unless it contains a floating edit.
+	            if (entry.selection?.floatingData && entry.selection?.dirty) markProjectDirty();
                 session.currentFrameIndex = idx;
                 renderCurrentFrame();
                 const inverse = {
@@ -2044,6 +2218,7 @@ const createAppInstance = () => createApp({
                 return inverse;
             }
             // structural
+	        markProjectDirty();
             const inverse = {
                 type: 'structural',
                 order: project.frames.slice(),
@@ -2741,13 +2916,14 @@ const createAppInstance = () => createApp({
                     ctx.closePath();
                 } else {
                     // Should be rect if originPath is null, but fallback
-                    ctx.rect(startX, startY, w, h);
+	                ctx.rect(startX, startY, session.selection.floatingData.width, session.selection.floatingData.height);
                 }
             }
             ctx.fill();
             ctx.restore();
 
             session.selection.dirty = true;
+	        markProjectDirty();
         };
 
         // 5. Onion Skin Logic
@@ -2805,19 +2981,33 @@ const createAppInstance = () => createApp({
             const sig = `${isActive ? 'A' + session.currentLayerId : 'all'}|${threshold}|${drawVis}`;
 
             const cached = onionMaskCache.get(frame.id);
-            if (cached && cached.sig === sig && cached.w === w && cached.h === h) return cached.canvas;
+	        if (cached && cached.sig === sig && cached.w === w && cached.h === h) {
+	            onionMaskCache.delete(frame.id);
+	            onionMaskCache.set(frame.id, cached); // refresh LRU order
+	            return cached.canvas;
+	        }
 
             const targetLayers = isActive ?
                 project.layers.filter(l => l.id === session.currentLayerId && l.type === 'draw') :
                 project.layers.filter(l => l.type === 'draw');
 
+	        if (cached) onionMaskCache.delete(frame.id);
             const off = (cached && cached.canvas) || makeSurface(w, h);
             off.width = w; off.height = h; // also clears
             const offCtx = off.getContext('2d', { willReadFrequently: true });
+	        const cells = peekFrameCells(frame.id) || {};
+	        const transientCells = !cellStore.has(frame.id);
             for (const layer of targetLayers) {
                 if (!layer.visible) continue;
-                offCtx.drawImage(cellSurface(frame, layer.id), 0, 0);
+	            const surface = cells[layer.id];
+	            if (surface) {
+	                offCtx.drawImage(surface, 0, 0);
+	            } else if (layer.id === 0) {
+	                offCtx.fillStyle = settings.backgroundColor || '#FFFFFF';
+	                offCtx.fillRect(0, 0, w, h);
+                }
             }
+	        if (transientCells) releaseCellSet(cells);
 
             // Luminance masking: drop bright pixels (background) so only ink remains.
             const imgData = offCtx.getImageData(0, 0, w, h);
@@ -2831,6 +3021,12 @@ const createAppInstance = () => createApp({
             offCtx.putImageData(imgData, 0, 0);
 
             onionMaskCache.set(frame.id, { sig, w, h, canvas: off });
+	        while (onionMaskCache.size > ONION_CACHE_LIMIT) {
+	            const oldestId = onionMaskCache.keys().next().value;
+	            const oldest = onionMaskCache.get(oldestId);
+	            onionMaskCache.delete(oldestId);
+	            if (oldest?.canvas !== off) releaseSurface(oldest?.canvas);
+	        }
             return off;
         };
 
@@ -3407,7 +3603,7 @@ const createAppInstance = () => createApp({
         const actions = {
             async initProject(metaOverrides = null) {
                 clearOnionCache();
-	                dirtyFrames.clear();
+	            resetCellStorage();
 	                project.frames = [];
 	                project.id = generateUUID();
 	                project.meta.title = (metaOverrides?.title || 'Untitled').trim() || 'Untitled';
@@ -3420,20 +3616,10 @@ const createAppInstance = () => createApp({
                     project.meta.fps = metaOverrides.fps;
                     settings.backgroundColor = metaOverrides.backgroundColor || settings.backgroundColor;
                 }
-                session.selection.active = false;
-                session.selection.path = [];
-                session.selection.originPath = null;
-                session.selection.rect = null;
-                session.selection.floatingData = null;
-                session.selection.floatingPos = {
-                    x: 0,
-                    y: 0
-                };
-                session.selection.initialPos = null;
-                session.selection.dirty = false;
-                ensureFrame(0);
-                await actions.addFrame(false);
-                session.currentFrameIndex = 0;
+	            resetSessionState();
+	            const initialFrame = ensureFrame(0);
+	            dirtyFrames.add(initialFrame.id);
+	            session.currentFrameIndex = 0;
                 await nextTick();
                 renderCurrentFrame();
                 // Clear any history accumulated during setup (e.g. the structural entry
@@ -3446,6 +3632,7 @@ const createAppInstance = () => createApp({
                     x: 0,
                     y: 0
                 };
+	            projectDirty.value = true;
             },
 
             async addFrame(copy = false, insertMode = 'after-current') {
@@ -3519,25 +3706,27 @@ const createAppInstance = () => createApp({
             async saveProject({ silent = false } = {}) {
                 await commitFloatingSelection();
                 if (currentFrame.value) flushFrameCells(currentFrame.value);
-                const db = await dbPromise;
-                const rawProject = toRaw(project);
-                const rawSettings = toRaw(settings);
-                const rawSession = toRaw(session);
+	            return await withEvictionPaused(async () => {
+	                const db = await dbPromise;
+	                const rawProject = toRaw(project);
+	                const rawSettings = toRaw(settings);
+	                const rawSession = toRaw(session);
 
-                const frames = rawProject.frames;
-                const { settings: _projectSettings, sessionState: _projectSessionState, ...projectData } = rawProject;
-                const meta = {
-                    ...projectData,
-                    frames: frames.map(f => f.id),
-                    settings: rawSettings,
-                    sessionState: {
-                        colors: rawSession.colors,
-                        brush: rawSession.brush
-                    },
-                    modifiedAt: Date.now()
-                };
+	                const frames = rawProject.frames;
+	                const { settings: _projectSettings, sessionState: _projectSessionState, ...projectData } = rawProject;
+	                const meta = {
+	                    ...projectData,
+	                    dataVersion: DATA_VERSION,
+	                    frames: frames.map(f => f.id),
+	                    settings: rawSettings,
+	                    sessionState: {
+	                        colors: rawSession.colors,
+	                        brush: rawSession.brush
+	                    },
+	                    modifiedAt: Date.now()
+	                };
 
-                try {
+	                try {
                     // Incremental save: only re-encode frames changed since the last save.
                     // Encode first — an IDB transaction must not span non-IDB awaits.
                     const records = [];
@@ -3556,10 +3745,15 @@ const createAppInstance = () => createApp({
                     for (const id of prevIds) if (!liveIds.has(id)) frameStore.delete(id);
                     await tx.done;
                     dirtyFrames.clear();
+	                project.meta.modifiedAt = meta.modifiedAt;
+	                projectDirty.value = false;
 	                    if (!silent) showToast('Saved!', 'success');
+	                    return true;
 	                } catch (e) {
 	                    if (!silent) showToast('Save failed: ' + e.message, 'error', 5000);
-                }
+	                    return false;
+	                }
+	            });
             },
 
             handleFrameContext(e, idx) {
@@ -3591,6 +3785,7 @@ const createAppInstance = () => createApp({
                     return { id: f.id, layers, thumbnail: f.thumbnail || null };
                 });
                 const data = JSON.stringify({
+	            dataVersion: DATA_VERSION,
                     id: rawProject.id,
                     meta: rawProject.meta,
                     layers: rawProject.layers,
@@ -3618,6 +3813,8 @@ const createAppInstance = () => createApp({
 
                 const reader = new FileReader();
                 reader.onload = async (e) => {
+	                if (!(await confirmProjectReplacement())) return;
+	                dirtyTrackingDepth++;
                     try {
                         const loaded = JSON.parse(e.target.result);
                         const {
@@ -3626,20 +3823,34 @@ const createAppInstance = () => createApp({
                             frames: loadedFrames,
                             ...loadedProject
                         } = loaded;
-                        if (loadedProject.id) project.id = loadedProject.id;
-                        if (loadedProject.meta) Object.assign(project.meta, loadedProject.meta);
-                        if (Array.isArray(loadedProject.layers)) project.layers = loadedProject.layers;
+	                    const loadedMeta = loadedProject.meta || {};
+	                    const clampInt = (value, min, max, fallback) => {
+	                        const n = Math.round(Number(value));
+	                        return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+	                    };
+	                    project.id = loadedProject.id || generateUUID();
+	                    project.meta = {
+	                        title: String(loadedMeta.title || 'Untitled').trim() || 'Untitled',
+	                        width: clampInt(loadedMeta.width, 64, 4096, 800),
+	                        height: clampInt(loadedMeta.height, 64, 4096, 600),
+	                        fps: clampInt(loadedMeta.fps, 1, 60, 8),
+	                        createdAt: Number.isFinite(Number(loadedMeta.createdAt)) ? Number(loadedMeta.createdAt) : Date.now(),
+	                        modifiedAt: Date.now()
+	                    };
+	                    project.layers = Array.isArray(loadedProject.layers) && loadedProject.layers.length
+	                        ? loadedProject.layers
+	                        : cloneDefaultLayers();
 
                         // Restore settings/session from JSON
                         if (loadedSettings) {
-                            Object.assign(settings, loadedSettings);
+	                        replaceSettingsState(loadedSettings);
+	                    } else {
+	                        replaceSettingsState();
                         }
-                        if (loadedSessionState) {
+	                    resetSessionState();
+	                    if (loadedSessionState) {
                             if (loadedSessionState.colors) Object.assign(session.colors, loadedSessionState.colors);
                             if (loadedSessionState.brush) Object.assign(session.brush, loadedSessionState.brush);
-                        } else if (loadedSettings?.backgroundColor) {
-                            // Legacy support
-                            settings.backgroundColor = loadedSettings.backgroundColor;
                         }
 
                         project.layers = project.layers.map(l => {
@@ -3648,17 +3859,17 @@ const createAppInstance = () => createApp({
                         });
 
                         // Rebuild cells from the data URLs in the JSON.
-                        cellStore.clear();
-                        dormantStore.clear();
-                        cellLru.clear();
-                        dirtyFrames.clear();
+	                    resetCellStorage();
                         clearOnionCache();
-                        frameClipboardCells = null;
                         const framesIn = Array.isArray(loadedFrames) ? loadedFrames : [];
                         const frameMeta = [];
+	                    const importedFrameIds = new Set();
                         for (const f of framesIn) {
+	                        if (!f || typeof f !== 'object') continue;
                             const layers = f.layers || {};
-                            const id = f.id || generateUUID();
+	                        let id = f.id || generateUUID();
+	                        if (importedFrameIds.has(id)) id = generateUUID();
+	                        importedFrameIds.add(id);
                             const bytesSet = {};
                             let canStayDormant = true;
                             for (const k in layers) {
@@ -3689,16 +3900,25 @@ const createAppInstance = () => createApp({
                         }
                         project.frames = frameMeta;
                         frameMeta.forEach(f => dirtyFrames.add(f.id)); // imported -> not yet in IDB
-                        if (project.frames.length === 0) { project.frames = []; ensureFrame(0); }
+	                    if (project.frames.length === 0) {
+	                        project.frames = [];
+	                        const initialFrame = ensureFrame(0);
+	                        dirtyFrames.add(initialFrame.id);
+	                    }
                         session.currentFrameIndex = 0;
                         resetAllHistory();
                         await nextTick();
                         renderCurrentFrame();
                         evictIfNeeded(); // the legacy (non-PNG) path decodes frames live
                         updateHistoryState();
+	                    projectDirty.value = true;
 	                        showToast('Project loaded!', 'success');
 	                    } catch (err) {
+	                    projectDirty.value = true;
 	                        showToast('Failed to load project: ' + err.message, 'error', 5000);
+	                } finally {
+	                    await nextTick();
+	                    dirtyTrackingDepth--;
                     }
                 };
                 reader.readAsText(file);
@@ -3780,7 +4000,7 @@ const createAppInstance = () => createApp({
                             });
                             ctx.closePath();
                         } else {
-                             ctx.rect(startX, startY, w, h);
+	                         ctx.rect(startX, startY, session.selection.floatingData.width, session.selection.floatingData.height);
                         }
                         ctx.fill();
                         ctx.restore();
@@ -3840,6 +4060,7 @@ const createAppInstance = () => createApp({
                 session.selection.originPath = null;
                 session.selection.active = true;
                 session.selection.dirty = true; // Pasted data is always floating (not on source)
+	            markProjectDirty();
 
                 // Draw to temp
                 const tempCtx = getTempCtx();
@@ -3945,8 +4166,11 @@ const createAppInstance = () => createApp({
                 frameContext.visible = false;
             },
 
-            clearSelection() {
+	        async clearSelection() {
                 if (!session.selection.active) return;
+	            if (session.selection.floatingData && session.selection.dirty) {
+	                await anchorSelection();
+	            }
                 const selectionBefore = snapshotSelectionState();
                 session.selection.active = false;
                 session.selection.floatingData = null;
@@ -3964,6 +4188,7 @@ const createAppInstance = () => createApp({
             },
 
             async confirmNewProject() {
+	            if (!(await confirmProjectReplacement())) return;
                 const clampInt = (v, lo, hi, def) => {
                     let n = Math.round(Number(v));
                     if (!Number.isFinite(n)) n = def;
@@ -4034,6 +4259,16 @@ const createAppInstance = () => createApp({
             }
         };
 
+	    // Native dialogs keep the single-file app dependency-free while still providing
+	    // Save / Discard / Cancel semantics (Cancel is the second dialog's cancel action).
+	    const confirmProjectReplacement = async () => {
+	        if (!projectDirty.value) return true;
+	        if (window.confirm('This project has unsaved changes. Save before continuing?')) {
+	            return await actions.saveProject();
+	        }
+	        return window.confirm('Discard the unsaved changes and continue?');
+	    };
+
 
         // Draw a frame onto a provided context while respecting layer visibility
         const drawFrameToContext = (ctx, frame) => {
@@ -4045,11 +4280,18 @@ const createAppInstance = () => createApp({
             ctx.clearRect(0, 0, w, h);
 
             const cells = peekFrameCells(frame.id) || {};
+	        const transientCells = !cellStore.has(frame.id);
             for (const layer of drawingLayers.value) {
                 if (!layer.visible) continue;
                 const surface = cells[layer.id];
-                if (surface) ctx.drawImage(surface, 0, 0);
+	            if (surface) {
+	                ctx.drawImage(surface, 0, 0);
+	            } else if (layer.id === 0) {
+	                ctx.fillStyle = settings.backgroundColor || '#FFFFFF';
+	                ctx.fillRect(0, 0, w, h);
+	            }
             }
+	        if (transientCells) releaseCellSet(cells);
         };
 
         // Ensure overlay paints before heavy work to avoid flashing
@@ -4074,10 +4316,7 @@ const createAppInstance = () => createApp({
                         self.postMessage({ id: m.id, ok: true });
                         return;
                     }
-                    if (m.type === 'png') {
-                        const png = UPNG.encode([m.buf], m.w, m.h, 0); // lossless single frame
-                        self.postMessage({ id: m.id, ok: true, result: png }, [png]);
-                    } else if (m.type === 'decode') {
+	                if (m.type === 'decode') {
                         const out = {};
                         const transfers = [];
                         for (const k in m.layers) {
@@ -4090,12 +4329,7 @@ const createAppInstance = () => createApp({
                     } else if (m.type === 'apng') {
                         const png = UPNG.encode(m.frames, m.w, m.h, 0, m.delays);
                         self.postMessage({ id: m.id, ok: true, result: png }, [png]);
-                    } else if (m.type === 'zip') {
-                        const files = {};
-                        for (let i = 0; i < m.frames.length; i++) files[m.names[i]] = new Uint8Array(UPNG.encode([m.frames[i]], m.w, m.h, 0));
-                        const zipped = fflate.zipSync(files, {});
-                        self.postMessage({ id: m.id, ok: true, result: zipped.buffer }, [zipped.buffer]);
-                    }
+	                }
                 } catch (err) {
                     self.postMessage({ id: m.id, ok: false, error: String((err && err.message) || err) });
                 }
@@ -4105,19 +4339,28 @@ const createAppInstance = () => createApp({
         let exportWorkerReady = null;
         let exportMsgId = 0;
         const exportPending = new Map();
+	    const failExportWorker = (worker, error) => {
+	        const failure = error instanceof Error ? error : new Error(String(error || 'export worker error'));
+	        for (const pending of exportPending.values()) pending.reject(failure);
+	        exportPending.clear();
+	        try { worker?.terminate(); } catch (_) {}
+	        if (exportWorker === worker) exportWorker = null;
+	        exportWorkerReady = null;
+	    };
         const getExportWorker = () => {
             if (exportWorkerReady) return exportWorkerReady;
             exportWorkerReady = new Promise((resolve, reject) => {
                 try {
                     const url = URL.createObjectURL(new Blob([EXPORT_WORKER_SRC], { type: 'text/javascript' }));
                     const w = new Worker(url);
+	                URL.revokeObjectURL(url);
                     w.onmessage = (e) => {
                         const p = exportPending.get(e.data.id);
                         if (!p) return;
                         exportPending.delete(e.data.id);
                         e.data.ok ? p.resolve(e.data.result) : p.reject(new Error(e.data.error));
                     };
-                    w.onerror = () => reject(new Error('export worker error'));
+	                w.onerror = () => failExportWorker(w, new Error('export worker error'));
                     const id = ++exportMsgId;
                     exportPending.set(id, { resolve: () => { exportWorker = w; resolve(w); }, reject });
                     w.postMessage({ type: 'init', id, base: location.href.replace(/[^/]*$/, '') });
@@ -4126,9 +4369,15 @@ const createAppInstance = () => createApp({
             return exportWorkerReady;
         };
         const callExportWorker = (msg, transfers) => new Promise((resolve, reject) => {
+	        if (!exportWorker) { reject(new Error('Export worker is unavailable.')); return; }
             const id = ++exportMsgId;
             exportPending.set(id, { resolve, reject });
-            exportWorker.postMessage({ ...msg, id }, transfers || []);
+	        try {
+	            exportWorker.postMessage({ ...msg, id }, transfers || []);
+	        } catch (err) {
+	            exportPending.delete(id);
+	            reject(err);
+	        }
         });
         // Compose a frame to RGBA bytes, yielding to the UI every few frames during a sweep.
         const composeFrameBuf = async (ctx, frame, w, h, i) => {
@@ -4136,6 +4385,8 @@ const createAppInstance = () => createApp({
             if ((i & 3) === 0) await new Promise(r => requestAnimationFrame(r));
             return new Uint8Array(ctx.getImageData(0, 0, w, h).data).buffer;
         };
+	    const MAX_APNG_RGBA_BYTES = 256 * 1024 * 1024;
+	    const MAX_ZIP_PNG_BYTES = 256 * 1024 * 1024;
 
         const exportAPNG = async () => {
             if (project.frames.length === 0) return;
@@ -4145,6 +4396,10 @@ const createAppInstance = () => createApp({
                 const bufs = [];
                 const w = project.meta.width;
                 const h = project.meta.height;
+	            const requiredBytes = w * h * 4 * project.frames.length;
+	            if (!Number.isSafeInteger(requiredBytes) || requiredBytes > MAX_APNG_RGBA_BYTES) {
+	                throw new Error(`APNG needs about ${Math.ceil(requiredBytes / 1024 / 1024)} MiB of frame buffers; the safe limit is 256 MiB. Use WebM or ZIP instead.`);
+	            }
 
                 const off = document.createElement('canvas');
                 off.width = w;
@@ -4160,6 +4415,7 @@ const createAppInstance = () => createApp({
                 const apng = worker
                     ? await callExportWorker({ type: 'apng', frames: bufs, w, h, delays }, bufs)
                     : UPNG.encode(bufs, w, h, 0, delays);
+	            assertCompletePng(apng, w, h);
 
                 const blob = new Blob([apng], { type: "image/png" });
                 const url = URL.createObjectURL(blob);
@@ -4188,24 +4444,31 @@ const createAppInstance = () => createApp({
                 off.height = h;
                 const ctx = off.getContext('2d');
 
-                const bufs = [];
-                const names = [];
+	            const zipChunks = [];
+	            let resolveZip, rejectZip;
+	            const zipDone = new Promise((resolve, reject) => { resolveZip = resolve; rejectZip = reject; });
+	            const zipWriter = new fflate.Zip((err, chunk, final) => {
+	                if (err) { rejectZip(err); return; }
+	                if (chunk?.length) zipChunks.push(chunk);
+	                if (final) resolveZip(new Blob(zipChunks, { type: 'application/zip' }));
+	            });
+	            let totalPngBytes = 0;
                 for (let i = 0; i < project.frames.length; i++) {
-                    bufs.push(await composeFrameBuf(ctx, project.frames[i], w, h, i));
-                    names.push(`frame_${String(i + 1).padStart(3, '0')}.png`);
+	                await drawFrameToContext(ctx, project.frames[i]);
+	                if ((i & 3) === 0) await new Promise(r => requestAnimationFrame(r));
+	                const name = `frame_${String(i + 1).padStart(3, '0')}.png`;
+	                const png = await canvasToPngBytes(off);
+	                totalPngBytes += png.byteLength;
+	                if (totalPngBytes > MAX_ZIP_PNG_BYTES) {
+	                    throw new Error('PNG data for this ZIP exceeds the safe 256 MiB memory limit. Export fewer or smaller frames.');
+	                }
+	                const entry = new fflate.ZipPassThrough(name);
+	                zipWriter.add(entry);
+	                entry.push(png, true);
                 }
-
-                const worker = await getExportWorker();
-                let zip;
-                if (worker) {
-                    zip = new Uint8Array(await callExportWorker({ type: 'zip', frames: bufs, names, w, h }, bufs));
-                } else {
-                    const files = {};
-                    for (let i = 0; i < bufs.length; i++) files[names[i]] = new Uint8Array(UPNG.encode([bufs[i]], w, h, 0));
-                    zip = fflate.zipSync(files);
-                }
-                const blob = new Blob([zip], { type: "application/zip" });
-                const url = URL.createObjectURL(blob);
+	            zipWriter.end();
+	            const zipBlob = await zipDone;
+	            const url = URL.createObjectURL(zipBlob);
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = `tegani_frames_${Date.now()}.zip`;
@@ -4352,48 +4615,79 @@ const createAppInstance = () => createApp({
         // --- Project loading & management ---
         // Restore a stored project (meta + frames) into the live reactive state.
         const loadProjectFromMeta = async (loadMeta) => {
-            const db = await dbPromise;
-            const frameIds = Array.isArray(loadMeta.frames) ? loadMeta.frames : [];
-            const records = (await Promise.all(frameIds.map(fid => db.get('frames', fid)))).filter(Boolean);
+	        dirtyTrackingDepth++;
+	        try {
+	            const db = await dbPromise;
+	            const frameIds = Array.isArray(loadMeta.frames) ? loadMeta.frames : [];
+	            const recordsById = new Map();
+	            const loadedRecords = await Promise.all(frameIds.map(fid => db.get('frames', fid)));
+	            loadedRecords.forEach(rec => { if (rec) recordsById.set(rec.id, rec); });
+	            const missingIds = frameIds.filter(id => !recordsById.has(id));
+	            const needsMigration = loadMeta.dataVersion !== DATA_VERSION;
 
-            const {
-                settings: loadedSettings,
-                sessionState: loadedSessionState,
-                frames: _frameIds,
-                ...loadedProject
-            } = loadMeta;
-            Object.assign(project, loadedProject);
+	            const {
+	                settings: loadedSettings,
+	                sessionState: loadedSessionState,
+	                frames: _frameIds,
+	                dataVersion: _dataVersion,
+	                ...loadedProject
+	            } = loadMeta;
+	            Object.assign(project, loadedProject);
+	            const storedMeta = loadedProject.meta || {};
+	            const clampInt = (value, min, max, fallback) => {
+	                const n = Math.round(Number(value));
+	                return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+	            };
+	            project.id = loadedProject.id || generateUUID();
+	            project.meta = {
+	                ...storedMeta,
+	                title: String(storedMeta.title || 'Untitled').trim() || 'Untitled',
+	                width: clampInt(storedMeta.width, 64, 4096, 800),
+	                height: clampInt(storedMeta.height, 64, 4096, 600),
+	                fps: clampInt(storedMeta.fps, 1, 60, 8),
+	                createdAt: Number.isFinite(Number(storedMeta.createdAt)) ? Number(storedMeta.createdAt) : Date.now()
+	            };
+	            replaceSettingsState(loadedSettings);
+	            resetSessionState();
+	            if (loadedSessionState) {
+	                if (loadedSessionState.colors) Object.assign(session.colors, loadedSessionState.colors);
+	                if (loadedSessionState.brush) Object.assign(session.brush, loadedSessionState.brush);
+	            }
 
-            if (loadedSettings) Object.assign(settings, loadedSettings);
-            if (loadedSessionState) {
-                if (loadedSessionState.colors) Object.assign(session.colors, loadedSessionState.colors);
-                if (loadedSessionState.brush) Object.assign(session.brush, loadedSessionState.brush);
-            }
+	            project.layers = (Array.isArray(project.layers) ? project.layers : cloneDefaultLayers()).map(l => ({
+	                ...l,
+	                type: l.type === 'fill' ? 'draw' : l.type
+	            }));
 
-            project.layers = project.layers.map(l => ({
-                ...l,
-                type: l.type === 'fill' ? 'draw' : l.type
-            }));
+	            resetCellStorage();
+	            clearOnionCache();
+	            for (const rec of recordsById.values()) await deserializeFrameCells(rec);
+	            project.frames = frameIds.map(id => {
+	                const rec = recordsById.get(id);
+	                return { id, thumbnail: rec?.thumbnail || null };
+	            });
+	            missingIds.forEach(id => dirtyFrames.add(id));
+	            if (project.frames.length === 0) {
+	                project.frames = [];
+	                const initialFrame = ensureFrame(0);
+	                dirtyFrames.add(initialFrame.id);
+	            }
 
-            // Rebuild cells from stored PNG blobs (project.meta is already set above).
-            cellStore.clear();
-            dormantStore.clear();
-            cellLru.clear();
-            dirtyFrames.clear(); // loaded frames are already persisted (clean)
-            clearOnionCache();
-            frameClipboardCells = null;
-            for (const rec of records) await deserializeFrameCells(rec);
-            project.frames = records.map(rec => ({ id: rec.id, thumbnail: rec.thumbnail || null }));
-            if (project.frames.length === 0) {
-                project.frames = [];
-                ensureFrame(0);
-            }
-
-            session.currentFrameIndex = 0;
-            resetAllHistory();
-            await nextTick();
-            renderCurrentFrame();
-            updateHistoryState();
+	            session.currentFrameIndex = 0;
+	            resetAllHistory();
+	            await nextTick();
+	            renderCurrentFrame();
+	            updateHistoryState();
+	            projectDirty.value = needsMigration || missingIds.length > 0 || frameIds.length === 0;
+	            if (missingIds.length > 0) {
+	                showToast(`${missingIds.length} missing frame(s) were restored as blank. Save to repair this project.`, 'info', 6000);
+	            } else if (needsMigration) {
+	                showToast('This project was upgraded. Save to finish the migration.', 'info', 5000);
+	            }
+	        } finally {
+	            await nextTick();
+	            dirtyTrackingDepth--;
+	        }
         };
 
         const showProjectsModal = ref(false);
@@ -4434,6 +4728,7 @@ const createAppInstance = () => createApp({
             const db = await dbPromise;
             const meta = await db.get('projects', id);
             if (!meta) return;
+	        if (!(await confirmProjectReplacement())) return;
             await commitFloatingSelection();
 	            await loadProjectFromMeta(meta);
 	            showProjectsModal.value = false;
@@ -4633,7 +4928,7 @@ const createAppInstance = () => createApp({
                         if (!plain) break;
                         // If selection active, clear it. Else delete frame.
                         if (session.selection.active) {
-                            actions.clearSelection();
+	                        await actions.clearSelection();
                         } else {
                             if (confirm('Delete current frame?')) {
                                 await actions.deleteFrame(session.currentFrameIndex);
@@ -4657,7 +4952,7 @@ const createAppInstance = () => createApp({
                             showProjectsModal.value = false;
                             showSettings.value = false;
                         } else if (session.selection.active) {
-                            actions.clearSelection();
+	                        await actions.clearSelection();
                         }
                         break;
                 }
@@ -4673,7 +4968,7 @@ const createAppInstance = () => createApp({
 
             // Unsaved-changes guard (autosave was deliberately removed; this is its complement).
             addWin('beforeunload', (e) => {
-                if (dirtyFrames.size === 0) return;
+	            if (!projectDirty.value) return;
                 e.preventDefault();
                 e.returnValue = '';
             });
@@ -4799,9 +5094,14 @@ const createAppInstance = () => createApp({
             }, {
                 deep: true
             });
+	        watch(settings, markProjectDirty, { deep: true });
+	        watch(() => project.meta.fps, markProjectDirty);
+	        watch(() => [session.colors.primary, session.colors.secondary,
+	            session.brush.penSize, session.brush.eraserSize], markProjectDirty);
             watch(() => project.layers.map(l => ({ id: l.id, visible: l.visible })), () => {
                 renderOnionSkin();
                 refreshAllThumbnails();
+	            markProjectDirty();
             });
             watch(selectionAnimationNeeded, (needed) => {
                 if (needed) startSelectionAnimation();
@@ -4845,7 +5145,8 @@ const createAppInstance = () => createApp({
 	            showExportModal,
 	            showNewProjectModal,
 	            toasts,
-	            isLoading,
+            isLoading,
+	        projectDirty,
             getThumb,
             openNewProjectModal,
             newProjectForm,
